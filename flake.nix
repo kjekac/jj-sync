@@ -9,12 +9,16 @@
     packages = eachSystem (system: let
       pkgs = nixpkgs.legacyPackages.${system};
       package = pkgs.callPackage ./jj-repo-sync.nix { };
-    in { default = package; jj-repo-sync = package; });
+    in { default = package; jj-repo-sync = package; } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+      native-cycle-check = pkgs.writeShellScriptBin "native-cycle-check" ''
+        exec ${pkgs.python3}/bin/python3 ${./tests/native-cycle.py} ${package}/bin/jj-repo-sync "$@"
+      '';
+    });
     checks = eachSystem (system: { inherit (self.packages.${system}) jj-repo-sync; });
     devShells = eachSystem (system: let
       pkgs = nixpkgs.legacyPackages.${system};
     in { default = pkgs.mkShell {
-      packages = [ pkgs.jujutsu pkgs.gitMinimal pkgs.openssh pkgs.python3.pkgs.pytest ];
+      packages = [ pkgs.cargo pkgs.rustc pkgs.rustfmt pkgs.clippy pkgs.jujutsu pkgs.gitMinimal pkgs.openssh pkgs.python3 ];
     }; });
   };
 }

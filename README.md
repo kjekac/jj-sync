@@ -1,49 +1,63 @@
 # jj-repo-sync
 
-A small helper for publishing unfinished Jujutsu work and fetching it between
-allowlisted development repositories. JJ owns reconciliation: the helper carries
-no rewrite planner, evolution ledger, or independent ancestry policy.
+A Rust CLI that publishes unfinished Jujutsu work and fetches it between
+allowlisted repositories on paired machines. Requires JJ 0.47.1 or newer.
 
-A scheduled `jj-repo-sync cycle` snapshots local working copies, publishes
-`hosts/<host>/work/<workspace>` bookmarks, exports refs, and fetches peers through
-read-only SSH. Ordinary bookmarks publish parked branches. Give work a bookmark
-before leaving it if it should remain advertised. Unbookmarked work stays in the
-originating JJ repository but is not a cross-host backup.
+`cycle` snapshots local working copies, publishes `hosts/<host>/work/<workspace>`
+bookmarks, and fetches peers through read-only SSH. JJ handles rewrites, rebases,
+abandonment, and divergence. Fetching can change ancestry and working files.
+Bookmark parked work to keep it published, and use one editing machine per active
+change.
 
-Use JJ 0.47.1 or newer. Native fetch can rebase mutable descendants and update
-working files. Independent edits can become divergent changes; reconcile those
-with JJ before continuing the same change on another machine. Split changes can
-require manual ancestry repair: a reader's child may follow only one split part,
-even though all published parts are fetched. A disappearing ref can be interpreted
-as abandonment. See [CONFIG.md](CONFIG.md) for the relevant JJ settings.
+## Use
 
-The helper preserves exact repository allowlists, restricted pairing keys, cached
-peer repositories, status reporting, and explicit guarded GitHub backups. The
-empty allowlist permits no repositories. Missing local repositories are fetched
-into `~/.local/state/jj-repo-sync/repos/<peer>/<root>/<path>`; offline peers keep
-the last fetched objects. `.jj-sync-ignore` excludes a directory subtree.
+Build with `nix build`, or run `nix run . -- --help`. Configure the tool and its
+SSH endpoint as described in [CONFIG.md](CONFIG.md), then schedule
+`jj-repo-sync cycle` on each machine.
 
-The dedicated SSH endpoint permits repository listing and `git-upload-pack` only.
-It uses a separate software key with no shell, forwarding, or PTY access. Pair via
-normal authenticated SSH using `jj-repo-sync pair <peer>`; revoke with
-`jj-repo-sync revoke <peer>`. Regular SSH and GitHub authentication keep their
-existing policy. Provision the endpoint and scheduler in your system configuration.
+| Command | Purpose |
+| --- | --- |
+| `setup` | Create the dedicated sync identity. |
+| `public-key` | Print its public key. |
+| `pair <peer>` | Exchange sync keys over normal authenticated SSH. |
+| `revoke <peer>` | Remove a peer's sync key. |
+| `cycle` | Publish local work and fetch peers. |
+| `status` | Print the latest saved cycle results. |
+| `github` | Back up host bookmarks and tags to an existing GitHub remote. |
 
-`jj-repo-sync github` backs up host workspace and feature bookmarks and local tags
-to an existing GitHub remote, using normal user authentication and JJ's guarded
-pushes. Fetch and reconcile unexpected remote changes before retrying.
+The dedicated endpoint permits repository listing and fetching only. Regular SSH
+and GitHub use normal user authentication. GitHub pushes are guarded; fetch and
+reconcile unexpected remote changes before retrying.
 
-Deployment tagging, archive retention, and immutability rules belong to the system
-configuration. An optional `postFetchCommand` receives the repository path after
-each successful fetch. In nix-config this runs `archive-deployments`, which retains
-exact `nixos/` and `darwin/` deployment commits in local archive tags.
+An empty repository allowlist permits no repositories. Missing local repositories
+are fetched into the state cache. Offline peers retain their last fetched objects
+and success timestamps. `cycle` saves status and exits nonzero if any operation
+fails.
 
-The catalog remains compatible with older peers: it advertises repository IDs and
-`jj` flags; extra fields from old peers are ignored. Pairing keys, caches, and status
-state remain usable. Old `history-v2/` and `heads/` files are unused. Older hosts
-continue using their own reconciliation policy until upgraded. Existing archive
-tags are ordinary JJ tags and remain intact. JJ operation logs remain local.
+## macOS
 
-Run `nix flake check` to exercise real disposable repositories, including repeated
-peer cycles, offline rewrites, independent edits, deployment tags, the restricted
-endpoint, and guarded backup. `nix develop` provides JJ and the test dependencies.
+Allow **JJ Repo Sync** in Privacy & Security > Local Network from the machine's
+graphical session. The executable embeds its permission identity and usage
+description. Failed cycles stay alive for at least 30 seconds so the permission
+alert can appear. Nix ad-hoc signs the executable; permission may need renewed
+approval after rebuilding.
+
+Run `nix run .#native-cycle-check` from a native macOS terminal or SSH session to
+check scheduled network access. It uses the installed SSH configuration,
+temporary state, and an empty repository allowlist, then waits for three successful
+scheduled passes. It lists peers without snapshotting or fetching repositories
+and removes its temporary agent afterward. Keep the GUI available for approval.
+
+## Development
+
+`nix develop` provides Rust, Cargo, JJ, Git, SSH, and test tools. Nix embeds tool
+paths in the executable. Python is used only by tests.
+
+```sh
+nix flake check
+nix develop -c cargo test
+nix develop -c cargo clippy --all-targets -- -D warnings
+nix develop -c cargo fmt --check
+```
+
+Tests use disposable repositories and isolated configuration, state, and transport.

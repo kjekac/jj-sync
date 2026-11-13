@@ -1,6 +1,6 @@
 # Configuration
 
-Provision the CLI configuration at `/etc/jj-repo-sync.json`, or pass `--config`:
+Read configuration from `/etc/jj-repo-sync.json`, or pass `--config <path>`:
 
 ```json
 {
@@ -8,22 +8,30 @@ Provision the CLI configuration at `/etc/jj-repo-sync.json`, or pass `--config`:
   "home": "/home/alice",
   "state": "/home/alice/.local/state/jj-repo-sync",
   "repositoryRoots": {"dev": "/home/alice/dev"},
-  "repositories": ["dev/nix-config"],
+  "repositories": ["dev/project"],
   "peers": {"laptop": {"address": "192.0.2.2", "sshAlias": "laptop"}},
   "sshConfig": "/etc/jj-repo-sync-ssh.conf",
   "remoteCommand": "/run/current-system/sw/bin/jj-repo-sync"
 }
 ```
 
-Root names and relative paths match between hosts. `repositories` is an exact
-allowlist; an absent or empty list permits no repositories. Discovery, serving,
-incoming catalogs, and GitHub backup respect it. Hidden directories, symlinks,
-`node_modules`, `target`, and `vendor` are skipped. The legacy unrestricted `roots`
-configuration is rejected.
+Host, peer, and root names use `[a-z][a-z0-9-]*`. Root names and relative repository
+paths match between machines; absolute root paths can differ. `repositories` is
+an exact allowlist for discovery, serving, incoming catalogs, and GitHub backup.
+An absent or empty list permits no repositories. `.jj-sync-ignore` excludes a
+subtree. Discovery skips hidden directories, symlinks, `node_modules`, `target`,
+and `vendor`.
 
-## Native JJ behavior
+`sshConfig` selects the dedicated sync credentials and host-key policy.
+`peers.<name>.sshAlias` selects the normal SSH destination used for pairing.
+`remoteCommand` is the executable invoked on that destination during pairing.
+`peers.<name>.address` records the peer's network address; outgoing SSH connections
+use peer names from `sshConfig`.
 
-Configure JJ on each host, including the user running scheduled cycles:
+## JJ settings
+
+Configure the scheduled user and interactive shell to use the same JJ version
+and these settings:
 
 ```toml
 [git]
@@ -35,54 +43,47 @@ write-change-id-header = true
 "immutable_heads()" = "tags() | remote_tags(remote=glob:sync-*) | present(published@origin)"
 ```
 
-These settings enable native rewrite inference, abandonment, and stable change IDs
-through Git transport. The helper uses JJ's configuration without overriding these
-settings. Its package and interactive JJ should use the same version (at least
-0.47.1). The nix-config module selects the helper's JJ package for Home Manager.
+Peer bookmarks remain untracked. The helper sets
+`remotes.sync-<peer>.auto-track-bookmarks = "glob:* ~ glob:*"` and refuses to fetch
+when that remote has tracked bookmarks. Workspace markers advertise recorded
+commits; JJ handles stale workspaces.
 
-Peer bookmarks are untracked, preventing automatic name adoption. The helper sets
-`remotes.sync-<peer>.auto-track-bookmarks = "glob:* ~ glob:*"` in each repository
-and refuses already tracked bookmarks on that remote. This does not disable
-native rewrite inference. Ordinary named branches and workspace markers are
-fetched. Markers advertise a workspace's recorded commit; other workspaces retain
-JJ's normal stale-workspace handling.
+Fetching snapshots and refreshes the current workspace. Removing a commit's last
+published ref can cause readers to abandon it and rebase its children. After a
+split, inspect local descendants and rebase them explicitly if they need both
+parts. Independent edits remain available as divergence. Deployment tags and
+immutability rules protect the exact commits they reference.
 
-Fetch snapshots and refreshes the current workspace. Native reconciliation can
-change ancestry and working files, and can introduce normal JJ rebase conflicts.
-Use one editing host per active change. Bookmark parked work to keep it published;
-removing its last published ref may cause readers to abandon it and rebase children
-onto its parents. Republishing it makes it available again but need not restore
-those children's previous ancestry. After splits, inspect local descendants and
-rebase them explicitly if they need both parts. Independent versions remain
-available as divergence rather than being automatically merged.
+## SSH endpoint
 
-The old `reconcile` field is unused. There is no helper-specific reconciliation
-mode or history protocol. To choose different behavior, configure JJ itself.
-Disabling `git.abandon-unreachable-commits` also disables native rewrite
-application in JJ 0.47.1.
+Provision a dedicated SSH daemon that forces `jj-repo-sync serve`, uses
+`<state>/authorized_keys`, and prohibits shells, forwarding, PTYs, and SSH startup
+scripts. The handler accepts `jj-repo-sync-list` and `git-upload-pack` requests
+for allowlisted repositories. Listing reads repository metadata without taking
+snapshots; schedule publication on each host.
 
-## Deployment retention
+The dedicated client configuration must pin host keys and use `<state>/identity`
+with batch authentication, `IdentityAgent none`, and `IdentitiesOnly yes`.
+Regular SSH and GitHub authentication use the user's normal configuration.
+Pair with `jj-repo-sync pair <peer>` over normal SSH. The remote pairing command
+`pair-receive <peer>` reads a public key from stdin and returns its own public key.
 
-An optional `postFetchCommand` is an absolute executable path. The helper invokes
-it directly, without a shell, passing the repository path as its only argument.
-It runs after successful peer and GitHub fetches; failure is reported as a cycle
-error. It is trusted local configuration and is never read from peer catalogs.
+## State and hooks
 
-The nix-config script archives observed deployment tags as
-`archive/<tag>/<commit-id>`, including both local and remote `nixos/` and `darwin/`
-tags. These ordinary local tags preserve exact commits when upstream tags move or
-are deleted. The immutable-heads rule above protects their ancestry. Mutable
-children of a deployment can still follow rewritten versions of their parent.
-Deployment creation and archive naming policy are outside this helper.
+The state directory contains the sync `identity`, paired keys in `peers/`, the
+restricted `authorized_keys`, cached repositories in `repos/<peer>/<repository>`,
+and `status.json`. A lock serializes local commands; the read-only server runs
+independently.
 
-## Restricted transport
+Status records the latest pass and retains peer and repository success timestamps
+across offline failures. `cycle` writes status before returning failure. `status`
+prints the saved results regardless of the last cycle's outcome.
 
-Provision a dedicated SSH daemon that forces `jj-repo-sync serve`, uses the state's
-`authorized_keys`, and prohibits shells, forwarding, PTYs, and SSH startup scripts.
-The handler accepts only `jj-repo-sync-list` and validated `git-upload-pack` requests
-for allowlisted repositories. Pin host keys and use the state's `identity` software
-key for this endpoint. Regular SSH and GitHub credentials stay separate.
+An optional `postFetchCommand` is an absolute executable path. It runs directly,
+with the repository path as its only argument, after each successful peer or
+GitHub fetch. Hook failure is reported as a cycle error. Use it for local policy
+such as retaining deployment tags.
 
-The endpoint lists repositories; it does not snapshot them. Schedule publication
-on each host. Repositories absent locally are fetched into the state cache.
-Status reports the latest pass while retaining offline success timestamps.
+`github` selects an existing GitHub remote, preferring `origin`. It fetches through
+an untracked `sync-github` remote, publishes host workspace and feature bookmarks,
+and pushes `hosts/<host>/*` bookmarks and local tags with JJ's guarded push.
