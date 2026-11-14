@@ -117,3 +117,33 @@ alone does not establish a rewrite. `--color=auto|always|never` controls
 native terminal rendering; JSON contains no ANSI escapes. `pending` omits
 already-known and proven superseded revisions and reports new tags and removed
 bookmarks separately.
+
+
+`jj-sync watch` is a persistent background process on Linux and macOS. It watches
+allowlisted live repositories' operation heads with native filesystem events,
+coalesces operations for 200 ms (at most one second under continuous activity),
+exports workspace markers/bookmarks/tags, and queues availability notifications.
+Ordinary file edits become publishable when JJ snapshots them; periodic cycles
+also snapshot working files. `jj-sync publish` forces publication without a fetch.
+
+The `jj-sync-notify <repository> <token>` restricted SSH request only queues an
+allowlisted repository ID. The receiving watcher immediately schedules a fetch
+from its configured peers into staging, using the same software-key transport as
+normal cycles. It cannot apply history or choose a command or destination. Queue
+writes are the endpoint's only new write capability; the Linux SSH service can
+write only the notification directory inside the otherwise read-only home.
+
+Publication and staging use separate locks and workers, so slow fetching does
+not delay local export or notification delivery. Notifications coalesce per
+repository and survive restarts; delivery retries every ten seconds. Incoming
+hints remain queued while staging is busy or fetching fails. Repeated tokens are
+deduplicated. Bookkeeping refs are excluded from publication fingerprints, and
+staging repositories are excluded from operation watches. Periodic cycles remain
+the fallback for missed filesystem events, missed hints and offline peers.
+
+Run `jj-sync watch --interval 60 --debounce-ms 200` under a supervisor. The interval
+controls recovery audits, not notification latency. Nix-config configures
+`jj-sync-watch.service` on NixOS and the `jj-sync-watch` LaunchAgent on macOS,
+alongside its existing periodic cycle. Activate both hosts to enable the new
+notification request. On macOS, Local Network access must cover the native
+watcher as well as interactive invocations.

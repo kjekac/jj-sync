@@ -120,3 +120,30 @@ such as retaining deployment tags.
 `github` selects an existing GitHub remote, preferring `origin`. It fetches through
 an untracked `sync-github` remote, publishes host workspace and feature bookmarks,
 and pushes `hosts/<host>/*` bookmarks and local tags with JJ's guarded push.
+
+
+## Event-driven publication and refresh
+
+Run `jj-sync watch` persistently alongside periodic cycles. Native filesystem
+watching covers live JJ operation heads and durable notification queues, including
+repositories with an external/shared JJ repository directory. `--debounce-ms`
+defaults to 200; `--interval` defaults to 60 seconds for recovery audits. Source
+operations publish without waiting for the staging lock. The daemon sends hints
+through the configured paired SSH endpoint and immediately fetches staging on
+receipt. It never applies those snapshots.
+
+The restricted server accepts `jj-sync-notify <repository> <token>` for configured
+repository IDs only. Tokens are opaque bounded identifiers. The authenticated
+request wakes a local worker that fetches configured peers; it contains no command
+or network address. Multiple requests coalesce. Failed delivery retries after ten
+seconds; failed/busy staging leaves incoming requests queued. Periodic cycles also
+recover missed hints. A Linux sandbox must grant write access to
+`state/notifications` while retaining read-only access to the repository roots.
+
+`notifications/published/` stores successful publication fingerprints;
+`outgoing/`, `incoming/` and `received/` hold bounded per-peer/repository queue and
+acknowledgement records. Source bookkeeping and received staging imports do not
+trigger another publication. Queue acknowledgement checks for a newer replacement
+before removing a record. Watcher configuration changes require a restart;
+nix-config embeds the configuration store path in each service's arguments so
+activation replaces the watcher when its policy changes.

@@ -24,6 +24,15 @@ struct Args {
 #[derive(Subcommand)]
 enum Action {
     Cycle,
+    /// Publish local operation changes and refresh staging on peer notifications.
+    Watch {
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
+        interval: u64,
+        #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u64).range(1..))]
+        debounce_ms: u64,
+    },
+    /// Publish workspace tips and queue notifications without fetching peers.
+    Publish,
     Serve,
     Setup,
     PublicKey,
@@ -74,6 +83,20 @@ fn execute(args: Args) -> Result<()> {
     )?);
     if matches!(args.command, Action::Serve) {
         return sync.serve(&std::env::var("SSH_ORIGINAL_COMMAND").unwrap_or_default());
+    }
+    if let Action::Watch {
+        interval,
+        debounce_ms,
+    } = &args.command
+    {
+        return sync.watch(
+            std::time::Duration::from_secs(*interval),
+            std::time::Duration::from_millis(*debounce_ms),
+        );
+    }
+    if matches!(args.command, Action::Publish) {
+        sync.publish()?;
+        return Ok(());
     }
     if let Action::Pending {
         path, count: true, ..
@@ -134,7 +157,7 @@ fn execute(args: Args) -> Result<()> {
             }
             Ok(())
         }
-        Action::Serve => unreachable!(),
+        Action::Serve | Action::Watch { .. } | Action::Publish => unreachable!(),
     }
 }
 fn main() -> ExitCode {

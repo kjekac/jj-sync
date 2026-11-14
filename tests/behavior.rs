@@ -1486,3 +1486,283 @@ fn structured_preview_pairs_rewrites_and_keeps_descendants_available_without_che
     assert!(!target.join("alacritty").exists());
     std::env::remove_var("GIT_SSH_VARIANT");
 }
+
+#[test]
+fn notification_hints_are_allowlisted_durable_coalesced_and_never_apply() {
+    let fixture = Fixture::new();
+    let mut writer = fixture.sync();
+    let source = fixture.repo("dev/project", false);
+    let target = fixture.repo("remote-dev/project", false);
+    let mut reader = fixture.sync();
+    reader.config.host = "remover".into();
+    reader.config.state = fixture.path("remote-state");
+    reader
+        .config
+        .repository_roots
+        .insert("dev".into(), fixture.path("remote-dev"));
+    writer.tools.ssh = transport(&fixture, &reader.config);
+    std::env::set_var("GIT_SSH_VARIANT", "ssh");
+    writer
+        .accept_key("remover", &reader.public_key().unwrap())
+        .unwrap();
+    assert_eq!(writer.publish().unwrap(), 1);
+    assert_eq!(writer.publish().unwrap(), 0);
+    // A failed delivery survives in the sender's queue.
+    let transport = writer.tools.ssh.clone();
+    writer.tools.ssh = fixture.script("offline-notify", "#!/bin/sh\nexit 1\n");
+    assert!(writer.flush_notifications().is_err());
+    writer.tools.ssh = transport;
+    writer.flush_notifications().unwrap();
+    let before = fixture.commit(&target, "@");
+    assert_eq!(reader.pending(&target).unwrap(), 0);
+    assert_eq!(fixture.commit(&target, "@"), before);
+    let incoming = reader.config.state.join("notifications/incoming");
+    assert_eq!(fs::read_dir(&incoming).unwrap().count(), 1);
+    // A repeated delivery coalesces to a single durable hint.
+    reader
+        .serve("jj-sync-notify dev/project duplicate")
+        .unwrap();
+    reader
+        .serve("jj-sync-notify dev/project duplicate")
+        .unwrap();
+    assert_eq!(fs::read_dir(&incoming).unwrap().count(), 1);
+    for request in [
+        "jj-sync-notify dev/private token",
+        "jj-sync-notify ../project token",
+        "jj-sync-notify dev/project token extra",
+        "jj-sync-notify dev/project 'token; id'",
+        "jj-sync-notify dev/project ''",
+        "jj-sync-notify dev/project",
+    ] {
+        assert!(reader.serve(request).is_err(), "{request}");
+    }
+    assert_eq!(fixture.commit(&target, "@"), before);
+    // Queueing needs no staging lock; a long-running apply cannot block it.
+    let guard = reader.lock().unwrap();
+    reader.serve("jj-sync-notify dev/project newer").unwrap();
+    reader.refresh_notifications().unwrap();
+    assert_eq!(fs::read_dir(&incoming).unwrap().count(), 1);
+    drop(guard);
+    // Publication continues even while the sender's staging lock is held.
+    let guard = writer.lock().unwrap();
+    fs::write(source.join("file"), "new work\n").unwrap();
+    fixture.jj(&source, &["status"], true);
+    assert_eq!(writer.publish().unwrap(), 1);
+    drop(guard);
+    std::env::remove_var("GIT_SSH_VARIANT");
+}
+
+#[test]
+fn operation_events_publish_notify_and_fetch_without_a_timer_or_feedback_loop() {
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        thread,
+        time::{Duration, Instant},
+    };
+    let fixture = Fixture::new();
+    let mut writer = fixture.sync();
+    writer.config.repositories = [id("dev/project")].into();
+    let source = fixture.repo("dev/project", true);
+    let target = fixture.repo("remote-dev/project", false);
+    let original = fixture.commit(&source, "@");
+    let mut reader = fixture.sync();
+    reader.config.host = "remover".into();
+    reader.config.state = fixture.path("remote-state");
+    reader
+        .config
+        .repository_roots
+        .insert("dev".into(), fixture.path("remote-dev"));
+    reader.config.repositories = [id("dev/project")].into();
+    reader.config.peers = [(
+        "thastrom".into(),
+        jj_sync::Peer {
+            address: "localhost".into(),
+            ssh_alias: "thastrom".into(),
+        },
+    )]
+    .into();
+    writer.snapshot(&source, false).unwrap();
+    reader
+        .fetch(
+            &target,
+            "sync-thastrom",
+            &fixture.url(&source),
+            false,
+            false,
+        )
+        .unwrap();
+    fixture.jj(&target, &["edit", &original], true);
+    fixture.jj(
+        &target,
+        &[
+            "git",
+            "remote",
+            "set-url",
+            "sync-thastrom",
+            "ssh://thastrom/dev/project",
+        ],
+        false,
+    );
+    let writer_config = fixture.path("writer-events.json");
+    let reader_config = fixture.path("reader-events.json");
+    fs::write(
+        &writer_config,
+        serde_json::to_string(&writer.config).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &reader_config,
+        serde_json::to_string(&reader.config).unwrap(),
+    )
+    .unwrap();
+    let calls = fixture.path("event-calls");
+    let transport = fixture.script("event-ssh", &format!(
+        "#!/bin/sh\nlast=\nprevious=\nfor arg do previous=$last; last=$arg; done\nprintf '%s %s\\n' \"$previous\" \"$last\" >> {}\ncase \"$previous\" in thastrom) config={};; remover) config={};; *) exit 1;; esac\nexport SSH_ORIGINAL_COMMAND=\"$last\"\nexec {} --config \"$config\" serve\n",
+        quote(&calls), quote(&writer_config), quote(&reader_config), shell_words::quote(env!("CARGO_BIN_EXE_jj-sync"))));
+    writer.tools.ssh = transport.clone();
+    reader.tools.ssh = transport;
+    std::env::set_var("GIT_SSH_VARIANT", "ssh");
+    writer
+        .accept_key("remover", &reader.public_key().unwrap())
+        .unwrap();
+    reader
+        .accept_key("thastrom", &writer.public_key().unwrap())
+        .unwrap();
+    let stop = AtomicBool::new(false);
+    thread::scope(|scope| {
+        let w = scope.spawn(|| {
+            writer.watch_until(Duration::from_secs(600), Duration::from_millis(50), &stop)
+        });
+        let r = scope.spawn(|| {
+            reader.watch_until(Duration::from_secs(600), Duration::from_millis(50), &stop)
+        });
+        let wait = |condition: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline {
+                if condition() {
+                    return true;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            false
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(wait(&|| fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .contains("jj-sync-notify")));
+            // Neither watcher audits nor the fallback timer can run during this test.
+            // Block staging on the source to prove publication is independent.
+            let guard = writer.lock().unwrap();
+            fs::write(source.join("file"), "event-driven work\n").unwrap();
+            fixture.jj(&source, &["status"], true);
+            let replacement = fixture.commit(&source, "@");
+            assert_ne!(replacement, original);
+            assert!(wait(&|| fixture
+                .commit(&source, "hosts/thastrom/work/default")
+                == replacement));
+            assert!(
+                wait(&|| reader.pending(&target).unwrap_or(0) == 1),
+                "Notification must trigger a fetch without polling the recovery interval"
+            );
+            let stage = reader.config.state.join("staging/thastrom/dev/project");
+            assert_eq!(
+                fixture.commit(&stage, "hosts/thastrom/work/default@sync-thastrom"),
+                replacement
+            );
+            assert_eq!(fixture.commit(&target, "@"), original);
+            assert_eq!(
+                fs::read_to_string(target.join("file")).unwrap(),
+                "initial\n"
+            );
+            drop(guard);
+            // Once publication and notification acknowledgements settle, the
+            // watcher must ignore its own ref operations and staging imports.
+            thread::sleep(Duration::from_millis(1500));
+            let before = fs::read_to_string(&calls).unwrap().lines().count();
+            thread::sleep(Duration::from_millis(1200));
+            let after = fs::read_to_string(&calls).unwrap().lines().count();
+            assert_eq!(
+                after, before,
+                "Self-generated operations must not cause notification loops"
+            );
+            reader.apply(&target, true).unwrap();
+            reader.apply(&target, false).unwrap();
+            assert_eq!(fixture.commit(&target, "@"), replacement);
+        }));
+        stop.store(true, Ordering::Relaxed);
+        w.join().unwrap().unwrap();
+        r.join().unwrap().unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    });
+    std::env::remove_var("GIT_SSH_VARIANT");
+}
+
+#[test]
+fn publication_does_not_swallow_an_operation_that_finishes_during_export() {
+    let fixture = Fixture::new();
+    let mut sync = fixture.sync();
+    let source = fixture.repo("dev/project", false);
+    let old = fixture.commit(&source, "@");
+    let real_jj = sync.tools.jj.clone();
+    let marker = fixture.path("advance-on-export");
+    let python = Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .unwrap();
+    let wrapper = fixture.script("concurrent-publication", &format!(
+        "#!{}\nimport os, subprocess, sys\nargs = sys.argv[1:]\np = subprocess.run([{}, *args], capture_output=True)\nif p.returncode == 0 and args[-2:] == ['git', 'export'] and not os.path.exists({}):\n open({}, 'w').close()\n open({}, 'w').write('new concurrent work')\n subprocess.run([{}, '-R', {}, 'status'], check=True, capture_output=True)\nsys.stdout.buffer.write(p.stdout)\nsys.stderr.buffer.write(p.stderr)\nsys.exit(p.returncode)\n",
+        String::from_utf8(python.stdout).unwrap().trim(), serde_json::to_string(&real_jj).unwrap(),
+        serde_json::to_string(&marker).unwrap(), serde_json::to_string(&marker).unwrap(),
+        serde_json::to_string(&source.join("file")).unwrap(), serde_json::to_string(&real_jj).unwrap(), serde_json::to_string(&source).unwrap()));
+    sync.tools.jj = wrapper;
+    assert_eq!(sync.publish().unwrap(), 1);
+    assert_ne!(fixture.commit(&source, "@"), old);
+    // JJ has already moved its local bookmark, while the last exported Git
+    // ref still describes the older snapshot advertised to the receiver.
+    assert_eq!(
+        fixture.commit(&source, "hosts/thastrom/work/default@git"),
+        old
+    );
+    assert_eq!(
+        sync.publish().unwrap(),
+        1,
+        "The second export must generate a fresh notification"
+    );
+    assert_eq!(
+        fixture.commit(&source, "hosts/thastrom/work/default"),
+        fixture.commit(&source, "@")
+    );
+    assert_eq!(sync.publish().unwrap(), 0);
+}
+
+#[test]
+fn notification_acknowledgement_preserves_a_newer_publication() {
+    let fixture = Fixture::new();
+    let mut sync = fixture.sync();
+    let source = fixture.repo("dev/project", false);
+    sync.accept_key("remover", &sync.public_key().unwrap())
+        .unwrap();
+    sync.publish().unwrap();
+    let config = fixture.path("publication-race.json");
+    fs::write(&config, serde_json::to_string(&sync.config).unwrap()).unwrap();
+    let advanced = fixture.path("advanced");
+    sync.tools.ssh = fixture.script("publish-before-ack", &format!(
+        "#!/bin/sh\nif [ ! -f {} ]; then\n : > {}\n printf 'newer work\\n' > {}\n {} --config {} publish\nfi\nprintf queued\n",
+        quote(&advanced), quote(&advanced), quote(&source.join("file")), shell_words::quote(env!("CARGO_BIN_EXE_jj-sync")), quote(&config)));
+    let queue = sync.config.state.join("notifications/outgoing");
+    let path = fs::read_dir(&queue)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let old = fs::read_to_string(&path).unwrap();
+    sync.flush_notifications().unwrap();
+    let new =
+        fs::read_to_string(&path).expect("Acknowledging an old hint must preserve its replacement");
+    assert_ne!(old, new);
+    sync.flush_notifications().unwrap();
+    assert_eq!(fs::read_dir(queue).unwrap().count(), 0);
+}

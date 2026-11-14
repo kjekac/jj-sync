@@ -32,6 +32,7 @@ rustPlatform.buildRustPackage {
     nativeReconciliation = true;
     stagedUpdates = true;
     structuredOutput = true;
+    eventNotifications = true;
     nativeExecutable = true;
     inherit jujutsu;
   };

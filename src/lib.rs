@@ -1,5 +1,6 @@
 mod process;
 mod report;
+mod watch;
 pub use process::{install_signal_handlers, received_signal};
 
 use anyhow::{bail, ensure, Context, Result};
@@ -477,9 +478,18 @@ impl Sync {
             return Ok(());
         }
         let args = request_words(original)?;
+        if args.first().is_some_and(|arg| arg == "jj-sync-notify") {
+            ensure!(
+                args.len() == 3,
+                "Expected an allowlisted repository and notification token"
+            );
+            self.receive_notification(&args[1], &args[2])?;
+            println!("queued");
+            return Ok(());
+        }
         ensure!(
             args.len() == 2 && args[0] == "git-upload-pack",
-            "Only repository listing and fetching are permitted"
+            "Only repository listing, fetching and availability notifications are permitted"
         );
         let id = RepositoryId::try_from(args[1].strip_prefix('/').unwrap_or(&args[1]).to_owned())?;
         let repos = self.discover()?;
@@ -1165,6 +1175,15 @@ impl Sync {
         _local: &BTreeMap<RepositoryId, Repository>,
         status: &mut Status,
     ) -> Result<()> {
+        self.sync_peer_repositories(peer, _local, status, None)
+    }
+    fn sync_peer_repositories(
+        &self,
+        peer: &str,
+        _local: &BTreeMap<RepositoryId, Repository>,
+        status: &mut Status,
+        only: Option<&BTreeSet<RepositoryId>>,
+    ) -> Result<()> {
         if !self
             .config
             .state
@@ -1194,7 +1213,10 @@ impl Sync {
             key.strip_prefix(&prefix)
                 .is_none_or(|id| catalog.keys().any(|key| key.0 == id))
         });
-        for id in catalog.keys() {
+        for id in catalog
+            .keys()
+            .filter(|id| only.is_none_or(|ids| ids.contains(*id)))
+        {
             let entry = status.entry(format!("{peer}/{}", id.0)).or_default();
             let result = (|| -> Result<PathBuf> {
                 let target = self.config.state.join("staging").join(peer).join(&id.0);
@@ -1240,6 +1262,7 @@ impl Sync {
         for entry in status.values_mut() {
             entry.error = None;
         }
+        let publication = self.publish();
         let local = self.discover()?;
         status.retain(|key, _| {
             key.strip_prefix("local/")
@@ -1247,8 +1270,8 @@ impl Sync {
         });
         for (id, repo) in &local {
             if repo.jj {
-                let entry = match self.snapshot(&repo.path, false) {
-                    Ok(()) => success(),
+                let entry = match &publication {
+                    Ok(_) => success(),
                     Err(error) => StatusEntry {
                         error: Some(format!("{error:#}")),
                         ..Default::default()
