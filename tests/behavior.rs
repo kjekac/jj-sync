@@ -1165,3 +1165,99 @@ fn surgery_snapshots_stay_isolated_until_explicit_application() {
         std::env::remove_var("GIT_SSH_VARIANT");
     }
 }
+
+#[test]
+fn peer_echoes_are_quiet_but_independent_edits_tags_and_deletions_are_pending() {
+    let fixture = Fixture::new();
+    let mut writer = fixture.sync();
+    let source = fixture.repo("dev/project", false);
+    fixture.jj(&source, &["bookmark", "set", "feature"], false);
+    writer.snapshot(&source, false).unwrap();
+    let original = fixture.commit(&source, "@");
+    let mut peer = fixture.sync();
+    peer.config.host = "remover".into();
+    peer.config.state = fixture.path("remote-state");
+    peer.config
+        .repository_roots
+        .insert("dev".into(), fixture.path("remote-dev"));
+    let replica = fixture.repo("remote-dev/project", false);
+    peer.fetch(
+        &replica,
+        "sync-thastrom",
+        &fixture.url(&source),
+        false,
+        false,
+    )
+    .unwrap();
+    fixture.jj(&replica, &["edit", &original], true);
+    peer.snapshot(&replica, false).unwrap();
+    writer.tools.ssh = transport(&fixture, &peer.config);
+    std::env::set_var("GIT_SSH_VARIANT", "ssh");
+    writer
+        .accept_key("remover", &peer.public_key().unwrap())
+        .unwrap();
+    // Reproduce the first snapshot arriving only after the author rebased.
+    fixture.jj(&source, &["new", "root()", "-m", "New base"], true);
+    fs::write(source.join("base"), "new base").unwrap();
+    fixture.jj(&source, &["status"], true);
+    let base = fixture.commit(&source, "@");
+    fixture.jj(&source, &["rebase", "-r", &original, "-d", &base], true);
+    fixture.jj(&source, &["edit", "feature"], true);
+    let rebased = fixture.commit(&source, "@");
+    for _ in 0..2 {
+        writer.cycle().unwrap();
+        assert_eq!(writer.pending(&source).unwrap(), 0);
+    }
+    let before = fixture.jj(
+        &source,
+        &["op", "log", "--limit", "1", "--no-graph", "-T", "id"],
+        false,
+    );
+    writer.apply(&source, true).unwrap();
+    writer.apply(&source, false).unwrap();
+    assert_eq!(fixture.commit(&source, "@"), rebased);
+    assert_eq!(
+        fixture.jj(
+            &source,
+            &["op", "log", "--limit", "1", "--no-graph", "-T", "id"],
+            false
+        ),
+        before
+    );
+    assert!(fixture
+        .jj(
+            &source,
+            &["log", "-r", "divergent()", "--no-graph", "-T", "commit_id"],
+            false
+        )
+        .is_empty());
+    // A peer's independent edit has the same change ID but no local evolution edge.
+    fs::write(replica.join("peer"), "independent edit").unwrap();
+    peer.snapshot(&replica, false).unwrap();
+    writer.cycle().unwrap();
+    assert_eq!(writer.pending(&source).unwrap(), 1);
+    writer.apply(&source, true).unwrap();
+    writer.apply(&source, false).unwrap();
+    assert!(!fixture
+        .jj(
+            &source,
+            &["log", "-r", "divergent()", "--no-graph", "-T", "commit_id"],
+            false
+        )
+        .is_empty());
+    // New tags still matter when all their commit objects are already known.
+    fixture.jj(&replica, &["tag", "set", "nixos/Remover/1"], false);
+    peer.snapshot(&replica, false).unwrap();
+    writer.cycle().unwrap();
+    assert_eq!(writer.pending(&source).unwrap(), 1);
+    writer.apply(&source, false).unwrap();
+    // Deleting a previously observed named bookmark must not be swallowed.
+    fixture.jj(&replica, &["bookmark", "set", "parked"], false);
+    peer.snapshot(&replica, false).unwrap();
+    writer.cycle().unwrap();
+    fixture.jj(&replica, &["bookmark", "delete", "parked"], false);
+    peer.snapshot(&replica, false).unwrap();
+    writer.cycle().unwrap();
+    assert_eq!(writer.pending(&source).unwrap(), 1);
+    std::env::remove_var("GIT_SSH_VARIANT");
+}

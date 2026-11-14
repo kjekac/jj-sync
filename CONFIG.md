@@ -56,6 +56,11 @@ those isolated repositories. Publication snapshots current working files.
 
 `status --json` includes per-repository `pending` flags. `pending --path DIR`
 prints the pending peer count using cached status, suitable for shell prompts.
+A snapshot containing only locally visible commits or proven predecessors of
+visible local changes is baselined without importing its refs. This prevents a
+peer's unchanged workspace marker from reintroducing your own superseded version.
+Matching change IDs alone do not establish that relationship. Independent edits,
+new deployment tags and removal of previously accepted bookmarks remain pending.
 At a coordinated handoff, run `apply --preview` in the receiving repository.
 It snapshots local files and prepares native JJ reconciliation in a disposable
 copy of its metadata and Git store. The preview shows fetch results, proposed

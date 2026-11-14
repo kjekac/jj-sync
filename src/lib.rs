@@ -693,10 +693,104 @@ impl Sync {
             .join(format!("{}.json", id.0))
     }
     fn pending_stage(&self, stage: &Path, peer: &str, id: &RepositoryId) -> Result<bool> {
-        Ok(
-            fs::read_to_string(self.accepted_path(peer, id)).unwrap_or_default()
-                != self.stage_fingerprint(stage, peer)?,
-        )
+        let fingerprint = self.stage_fingerprint(stage, peer)?;
+        let accepted = self.accepted_path(peer, id);
+        let previous = match fs::read_to_string(&accepted) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        if previous == fingerprint {
+            return Ok(false);
+        }
+        let repos = self.discover()?;
+        let Some(local) = repos.get(id).filter(|repo| repo.jj) else {
+            return Ok(true);
+        };
+        let incoming = parse_pairs(&self.stage_refs(stage, peer)?, '\t')?;
+        // A removed previously accepted bookmark is a real publication change,
+        // even when its old commit remains available locally.
+        if previous
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .any(|(name, _)| !incoming.contains_key(name))
+        {
+            return Ok(true);
+        }
+        let visible = self.jj(
+            &local.path,
+            &[
+                "--at-op=@",
+                "log",
+                "-r",
+                "all()",
+                "--no-graph",
+                "-T",
+                "commit_id ++ \"\\n\"",
+            ],
+            false,
+            false,
+            false,
+        )?;
+        let mut accounted: BTreeSet<String> = visible.lines().map(str::to_owned).collect();
+        let evolution = self.jj(&local.path, &["--at-op=@", "evolog", "-r", "all()", "--no-graph", "-T",
+            "commit.commit_id() ++ \" \" ++ commit.change_id() ++ \" \" ++ predecessors.map(|p| p.change_id() ++ \":\" ++ p.commit_id()).join(\",\") ++ \"\\n\""], false, false, false)?;
+        let mut edges = Vec::new();
+        for line in evolution.lines() {
+            let mut fields = line.splitn(3, ' ');
+            let successor = fields.next().unwrap_or_default();
+            let change = fields.next().unwrap_or_default();
+            for edge in fields.next().unwrap_or_default().split(',') {
+                if let Some((old_change, old)) = edge.split_once(':') {
+                    if old_change == change {
+                        edges.push((successor.to_owned(), old.to_owned()));
+                    }
+                }
+            }
+        }
+        // Only actual local evolution establishes a superseded version.
+        // A matching change ID on an independent peer edit is insufficient.
+        loop {
+            let before = accounted.len();
+            for (successor, old) in &edges {
+                if accounted.contains(successor) {
+                    accounted.insert(old.clone());
+                }
+            }
+            if accounted.len() == before {
+                break;
+            }
+        }
+        if incoming
+            .values()
+            .any(|revision| !accounted.contains(revision))
+        {
+            return Ok(true);
+        }
+        let template =
+            "name ++ \" \" ++ if(conflict, \"CONFLICT\", normal_target.commit_id()) ++ \"\\n\"";
+        let local_tags = self.jj(
+            &local.path,
+            &["--at-op=@", "tag", "list", "--all-remotes", "-T", template],
+            false,
+            false,
+            false,
+        )?;
+        let peer_tags = self.jj(
+            stage,
+            &["tag", "list", "--all-remotes", "-T", template],
+            false,
+            false,
+            false,
+        )?;
+        let local_tags: BTreeSet<_> = local_tags.lines().collect();
+        if peer_tags.lines().any(|tag| !local_tags.contains(tag)) {
+            return Ok(true);
+        }
+        // Baseline a fully accounted-for snapshot without importing stale refs.
+        // This also records known bookmark names so later deletions are noticed.
+        write_atomic(&accepted, &fingerprint)?;
+        Ok(false)
     }
     pub fn pending(&self, path: &Path) -> Result<usize> {
         let status = self.read_status()?;
