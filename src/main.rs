@@ -16,6 +16,8 @@ use std::{
 struct Args {
     #[arg(long, default_value = "/etc/jj-sync.json", global = true)]
     config: PathBuf,
+    #[arg(long, global = true, default_value = "auto", value_parser = ["auto", "always", "never"])]
+    color: String,
     #[command(subcommand)]
     command: Action,
 }
@@ -51,6 +53,8 @@ enum Action {
         cached: bool,
     },
     Apply {
+        #[arg(long)]
+        json: bool,
         #[arg(long = "dry-run", alias = "preview")]
         dry_run: bool,
         #[arg(long)]
@@ -102,11 +106,12 @@ fn execute(args: Args) -> Result<()> {
             dry_run,
             cached,
             verbose,
+            json,
         } => {
             if !cached && (dry_run || !sync.has_preview(&path)?) {
                 sync.cycle()?;
             }
-            sync.apply_with_details(&path, dry_run, verbose)
+            sync.apply_with_output(&path, dry_run, verbose, json, &args.color)
         }
         Action::Pending {
             path, json, cached, ..
@@ -116,12 +121,14 @@ fn execute(args: Args) -> Result<()> {
                     eprintln!("Refresh failed; showing cached results: {error:#}");
                 }
             }
-            sync.show_pending(&path, json)
+            sync.show_pending_with_color(&path, json, &args.color)
         }
-        Action::Status { json: _ } => {
+        Action::Status { json } => {
             let path = sync.config.state.join("status.json");
             if path.exists() {
                 print!("{}", fs::read_to_string(path)?);
+            } else if json {
+                println!("{{}}");
             } else {
                 println!("No sync cycle has run yet.");
             }

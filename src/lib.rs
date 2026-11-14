@@ -1,4 +1,5 @@
 mod process;
+mod report;
 pub use process::{install_signal_handlers, received_signal};
 
 use anyhow::{bail, ensure, Context, Result};
@@ -246,6 +247,25 @@ impl Sync {
                 .env("GIT_TERMINAL_PROMPT", "0");
         }
         process::output(command, None, interactive)
+    }
+    fn jj_display(&self, repo: &Path, args: &[&str], color: &str) -> Result<String> {
+        use std::io::IsTerminal;
+        let color = match color {
+            "auto" => {
+                if std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() {
+                    "always"
+                } else {
+                    "never"
+                }
+            }
+            other => other,
+        };
+        let mut command = self.command(&self.tools.jj);
+        command
+            .current_dir(repo)
+            .args(["--no-pager", "--ignore-working-copy", "--color", color])
+            .args(args);
+        process::output(command, None, false)
     }
     pub fn lock(&self) -> Result<File> {
         private_dir(&self.config.state)?;
@@ -717,50 +737,7 @@ impl Sync {
         {
             return Ok(true);
         }
-        let visible = self.jj(
-            &local.path,
-            &[
-                "--at-op=@",
-                "log",
-                "-r",
-                "all()",
-                "--no-graph",
-                "-T",
-                "commit_id ++ \"\\n\"",
-            ],
-            false,
-            false,
-            false,
-        )?;
-        let mut accounted: BTreeSet<String> = visible.lines().map(str::to_owned).collect();
-        let evolution = self.jj(&local.path, &["--at-op=@", "evolog", "-r", "all()", "--no-graph", "-T",
-            "commit.commit_id() ++ \" \" ++ commit.change_id() ++ \" \" ++ predecessors.map(|p| p.change_id() ++ \":\" ++ p.commit_id()).join(\",\") ++ \"\\n\""], false, false, false)?;
-        let mut edges = Vec::new();
-        for line in evolution.lines() {
-            let mut fields = line.splitn(3, ' ');
-            let successor = fields.next().unwrap_or_default();
-            let change = fields.next().unwrap_or_default();
-            for edge in fields.next().unwrap_or_default().split(',') {
-                if let Some((old_change, old)) = edge.split_once(':') {
-                    if old_change == change {
-                        edges.push((successor.to_owned(), old.to_owned()));
-                    }
-                }
-            }
-        }
-        // Only actual local evolution establishes a superseded version.
-        // A matching change ID on an independent peer edit is insufficient.
-        loop {
-            let before = accounted.len();
-            for (successor, old) in &edges {
-                if accounted.contains(successor) {
-                    accounted.insert(old.clone());
-                }
-            }
-            if accounted.len() == before {
-                break;
-            }
-        }
+        let accounted = self.accounted_revisions(&local.path)?;
         if incoming
             .values()
             .any(|revision| !accounted.contains(revision))
@@ -791,6 +768,53 @@ impl Sync {
         // This also records known bookmark names so later deletions are noticed.
         write_atomic(&accepted, &fingerprint)?;
         Ok(false)
+    }
+    fn accounted_revisions(&self, repo: &Path) -> Result<BTreeSet<String>> {
+        let visible = self.jj(
+            repo,
+            &[
+                "--at-op=@",
+                "log",
+                "-r",
+                "all()",
+                "--no-graph",
+                "-T",
+                "commit_id ++ \"\\n\"",
+            ],
+            false,
+            false,
+            false,
+        )?;
+        let mut accounted: BTreeSet<String> = visible.lines().map(str::to_owned).collect();
+        let evolution = self.jj(repo, &["--at-op=@", "evolog", "-r", "all()", "--no-graph", "-T",
+            "commit.commit_id() ++ \" \" ++ commit.change_id() ++ \" \" ++ predecessors.map(|p| p.change_id() ++ \":\" ++ p.commit_id()).join(\",\") ++ \"\\n\""], false, false, false)?;
+        let mut edges = Vec::new();
+        for line in evolution.lines() {
+            let mut fields = line.splitn(3, ' ');
+            let successor = fields.next().unwrap_or_default();
+            let change = fields.next().unwrap_or_default();
+            for edge in fields.next().unwrap_or_default().split(',') {
+                if let Some((old_change, old)) = edge.split_once(':') {
+                    if old_change == change {
+                        edges.push((successor.to_owned(), old.to_owned()));
+                    }
+                }
+            }
+        }
+        // Only actual local evolution establishes a superseded version.
+        // A matching change ID on an independent peer edit is insufficient.
+        loop {
+            let before = accounted.len();
+            for (successor, old) in &edges {
+                if accounted.contains(successor) {
+                    accounted.insert(old.clone());
+                }
+            }
+            if accounted.len() == before {
+                break;
+            }
+        }
+        Ok(accounted)
     }
     pub fn pending(&self, path: &Path) -> Result<usize> {
         let status = self.read_status()?;
@@ -840,9 +864,22 @@ impl Sync {
             .exists())
     }
     pub fn show_pending(&self, path: &Path, json: bool) -> Result<()> {
-        let (id, _) = self.local_repository(path)?;
+        self.show_pending_with_color(path, json, "auto")
+    }
+    pub fn show_pending_with_color(&self, path: &Path, json: bool, color: &str) -> Result<()> {
+        let (id, local) = self.local_repository(path)?;
         let status = self.read_status()?;
+        let accounted = self.accounted_revisions(&local.path)?;
         let mut updates = BTreeMap::new();
+        let tag_template =
+            "name ++ \" \" ++ if(conflict, \"CONFLICT\", normal_target.commit_id()) ++ \"\\n\"";
+        let local_tags = self.jj(
+            &local.path,
+            &["tag", "list", "--all-remotes", "-T", tag_template],
+            false,
+            false,
+            false,
+        )?;
         for peer in self.config.peers.keys() {
             let entry = status
                 .get(&format!("{peer}/{}", id.0))
@@ -852,6 +889,50 @@ impl Sync {
                 .get(peer)
                 .and_then(|e| e.error.clone())
                 .or(entry.error.clone());
+            let mut revisions = Vec::new();
+            let mut tags = Vec::new();
+            let mut deleted_bookmarks = Vec::new();
+            if entry.pending == Some(true) {
+                let stage = self.config.state.join("staging").join(peer).join(&id.0);
+                let refs = parse_pairs(&self.stage_refs(&stage, peer)?, '\t')?;
+                let tips: BTreeSet<_> = refs.values().cloned().collect();
+                if !tips.is_empty() {
+                    revisions = self
+                        .revisions(
+                            &stage,
+                            &format!(
+                                "ancestors({})",
+                                tips.into_iter().collect::<Vec<_>>().join(" | ")
+                            ),
+                        )?
+                        .into_values()
+                        .filter(|r| !accounted.contains(&r.commit_id))
+                        .collect();
+                }
+                tags = self
+                    .jj(
+                        &stage,
+                        &["tag", "list", "--all-remotes", "-T", tag_template],
+                        false,
+                        false,
+                        false,
+                    )?
+                    .lines()
+                    .filter(|tag| !local_tags.lines().any(|local| local == *tag))
+                    .map(str::to_owned)
+                    .collect();
+                let previous = match fs::read_to_string(self.accepted_path(peer, &id)) {
+                    Ok(text) => text,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(e) => return Err(e.into()),
+                };
+                deleted_bookmarks = previous
+                    .lines()
+                    .filter_map(|line| line.split_once('\t'))
+                    .filter(|(name, _)| !refs.contains_key(*name))
+                    .map(|(name, _)| name.to_owned())
+                    .collect();
+            }
             if !json {
                 let state = if entry.pending == Some(true) {
                     "updates staged"
@@ -867,22 +948,40 @@ impl Sync {
                 if let Some(error) = &error {
                     println!("  Fetch error: {error}");
                 }
-                if entry.pending == Some(true) {
+                if !revisions.is_empty() {
                     let stage = self.config.state.join("staging").join(peer).join(&id.0);
-                    let refs = parse_pairs(&self.stage_refs(&stage, peer)?, '\t')?;
-                    let tips: BTreeSet<_> = refs.values().cloned().collect();
-                    if !tips.is_empty() {
-                        println!("{}", self.jj(&stage, &["log", "-r", &tips.into_iter().collect::<Vec<_>>().join(" | "), "--no-graph", "--limit", "8", "-T", "commit_id.short() ++ \" \" ++ description.first_line() ++ \"\\n\""], false, false, false)?);
+                    let revset = revisions
+                        .iter()
+                        .map(|r| r.commit_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    println!("  {} incoming revisions:", revisions.len());
+                    println!(
+                        "{}",
+                        self.jj_display(&stage, &["log", "-r", &revset, "--limit", "12"], color)?
+                    );
+                    if revisions.len() > 12 {
+                        println!(
+                            "  … {} more; use --json for all revisions",
+                            revisions.len() - 12
+                        );
                     }
                 }
+                for tag in &tags {
+                    println!("  Deployment/tag update: {tag}");
+                }
+                for name in &deleted_bookmarks {
+                    println!("  Bookmark removed: {name}");
+                }
             }
-            updates.insert(peer, serde_json::json!({"pending": entry.pending.unwrap_or(false), "lastSuccess": entry.last_success, "error": error}));
+            updates.insert(peer, serde_json::json!({"pending": entry.pending.unwrap_or(false), "lastSuccess": entry.last_success,
+                "error": error, "revisions": revisions, "tags": tags, "deleted_bookmarks": deleted_bookmarks}));
         }
         if json {
             println!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &serde_json::json!({"repository": id.0, "peers": updates})
+                    &serde_json::json!({"schema_version": 1, "repository": id.0, "peers": updates})
                 )?
             );
         } else if updates.values().any(|e| e["pending"] == true) {
@@ -890,18 +989,31 @@ impl Sync {
         }
         Ok(())
     }
-    fn visible_revisions(&self, repo: &Path) -> Result<BTreeMap<String, String>> {
-        parse_pairs(&self.jj(repo, &["log", "-r", "all()", "--no-graph", "-T",
-            "commit_id ++ \"\\t\" ++ change_id.short() ++ \" \" ++ description.first_line() ++ \"\\n\""], false, false, false)?, '\t')
-    }
     pub fn apply_with_details(&self, path: &Path, preview: bool, verbose: bool) -> Result<()> {
-        self.apply_inner(path, preview, verbose)
+        self.apply_inner(path, preview, verbose, false, "auto")
     }
     /// Apply only snapshots already downloaded by cycle. No network operations.
     pub fn apply(&self, path: &Path, preview: bool) -> Result<()> {
-        self.apply_inner(path, preview, false)
+        self.apply_inner(path, preview, false, false, "auto")
     }
-    fn apply_inner(&self, path: &Path, preview: bool, verbose: bool) -> Result<()> {
+    pub fn apply_with_output(
+        &self,
+        path: &Path,
+        preview: bool,
+        verbose: bool,
+        json: bool,
+        color: &str,
+    ) -> Result<()> {
+        self.apply_inner(path, preview, verbose, json, color)
+    }
+    fn apply_inner(
+        &self,
+        path: &Path,
+        preview: bool,
+        verbose: bool,
+        json: bool,
+        color: &str,
+    ) -> Result<()> {
         let path = path.canonicalize()?;
         let repos = self.discover()?;
         let (id, repo) = repos
@@ -917,7 +1029,11 @@ impl Sync {
                 pending_peers.insert(peer.clone());
             }
         }
-        let before_revisions = self.visible_revisions(&repo.path)?;
+        let before_revisions = self.revisions(&repo.path, "all()")?;
+        let before_refs = (
+            self.refs(&repo.path, "bookmark")?,
+            self.refs(&repo.path, "tag")?,
+        );
         let baseline = self.jj(
             &repo.path,
             &["op", "log", "--limit", "1", "--no-graph", "-T", "id"],
@@ -944,15 +1060,6 @@ impl Sync {
                 "Local history or staged updates changed since preview; run apply --dry-run again"
             );
         }
-        if pending_peers.is_empty() {
-            if preview {
-                write_atomic(&preview_path, &token)?;
-            } else if preview_path.exists() {
-                fs::remove_file(&preview_path)?;
-            }
-            println!("No pending updates for {}.", id.0);
-            return Ok(());
-        }
         let before_tip = self.jj(
             &repo.path,
             &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
@@ -961,7 +1068,7 @@ impl Sync {
             false,
         )?;
         let isolated;
-        let target = if preview {
+        let target = if preview && !pending_peers.is_empty() {
             isolated = tempfile::tempdir()?;
             copy_directory(&repo.path.join(".jj"), &isolated.path().join(".jj"))?;
             let directory = self.jj(&repo.path, &["git", "root"], false, false, false)?;
@@ -1004,10 +1111,6 @@ impl Sync {
                 "git", "fetch", "--remote", &name, "--branch", "glob:*", "--tag", "glob:*",
             ];
             self.jj(&target, &args, !preview, false, false)?;
-            println!(
-                "{} staged update from {peer}.",
-                if preview { "Previewing" } else { "Applied" }
-            );
             if !preview {
                 if let Some(hook) = &self.config.post_fetch_command {
                     let mut command = self.command(hook);
@@ -1020,81 +1123,27 @@ impl Sync {
                 )?;
             }
         }
-        let after_revisions = self.visible_revisions(&target)?;
-        let added: Vec<_> = after_revisions
-            .iter()
-            .filter(|(id, _)| !before_revisions.contains_key(*id))
-            .collect();
-        let removed: Vec<_> = before_revisions
-            .iter()
-            .filter(|(id, _)| !after_revisions.contains_key(*id))
-            .collect();
-        println!(
-            "History: {} revisions added, {} retired.",
-            added.len(),
-            removed.len()
-        );
-        for (label, rows) in [("+", &added), ("-", &removed)] {
-            for (id, description) in rows.iter().take(8) {
-                println!("  {label} {} {description}", &id[..12]);
-            }
-            if rows.len() > 8 {
-                println!("  … {} more (use --verbose)", rows.len() - 8);
-            }
-        }
-        if verbose {
-            println!(
-                "{}",
-                self.jj(
-                    &target,
-                    &["op", "diff", "--from", &baseline, "--to", "@", "--no-graph"],
-                    false,
-                    false,
-                    false
-                )?
-            );
-        }
-        println!(
-            "Workspace content changes:\n{}",
-            self.jj(
-                &target,
-                &["diff", "--from", &before_tip, "--to", "@", "--stat"],
-                false,
-                false,
-                false
-            )?
-        );
+        let report = self.report(
+            &target,
+            &before_revisions,
+            &before_tip,
+            &baseline,
+            &before_refs,
+            &id.0,
+            pending_peers.into_iter().collect(),
+            preview,
+        )?;
         if preview {
             write_atomic(&preview_path, &token)?;
         } else if preview_path.exists() {
             fs::remove_file(&preview_path)?;
         }
-        for (label, revset) in [
-            ("Conflicts", "conflicts()"),
-            ("Divergence", "divergent() ~ immutable()"),
-        ] {
-            let affected = self.jj(
-                &target,
-                &[
-                    "log",
-                    "-r",
-                    revset,
-                    "--no-graph",
-                    "--limit",
-                    "8",
-                    "-T",
-                    "commit_id.short() ++ \" \" ++ description.first_line() ++ \"\\n\"",
-                ],
-                false,
-                false,
-                false,
-            )?;
-            if !affected.is_empty() {
-                println!("{label} requiring review:\n{affected}");
-            }
-        }
-        if preview {
-            println!("Run `jj-sync apply` to accept this staged state.");
+        if json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else if report.peers.is_empty() {
+            println!("No pending updates for {}.", id.0);
+        } else {
+            self.render_report(&target, &report, verbose, color)?;
         }
         if !preview {
             let mut status = self.read_status()?;

@@ -83,3 +83,37 @@ full operation diff. Background cycles keep history ready for application.
 Coordinate the checkpoint with the editing host. Check conflicts, divergence,
 and dependent work after applying. The Nushell prompt supplied by nix-config
 shows `↓sync:N` when peers have pending snapshots for the current repository.
+
+
+Nushell integration is installed at `share/nushell/jj-sync-commands.nu`. Load it
+with `use /path/to/package/share/nushell/jj-sync-commands.nu *`; nix-config loads
+it automatically. The custom commands return records:
+
+```nu
+jj-sync pending                              # One row per peer, including incoming revisions
+jj-sync status                               # Cached transport status
+let preview = (jj-sync apply --dry-run)
+$preview.changes | select change_id before after kind description
+$preview.workspace                           # Checkout transition and file changes
+$preview.evolution                           # JJ predecessor relationships, including splits
+jj-sync apply
+^jj-sync apply --dry-run                      # Colored terminal graph and comparison
+^jj-sync apply --dry-run --verbose            # Also show the native operation diff
+```
+
+The terminal comparison pairs versions by change ID and renders the proposed
+visible history with JJ. `@` marks the resulting checkout. Apply follows the
+current change's rewrite; incoming descendants remain available without moving
+the checkout to their tip. Workspace file changes are shown separately from
+history changes. Preview uses repository-relative paths.
+
+`pending --json` and `apply --dry-run --json` provide versioned JSON on stdout;
+diagnostics go to stderr. Reports contain full revision/change IDs, parent IDs,
+paired before/after revision arrays, JJ evolution edges, changed bookmarks and
+tags, checkout/file changes, conflicts and divergence. Evolution edges expose relationships JJ has retained, including different change
+IDs when available. Git transport can omit cross-change evolution metadata; split
+parts still appear with their actual change IDs and parents. A shared change ID
+alone does not establish a rewrite. `--color=auto|always|never` controls
+native terminal rendering; JSON contains no ANSI escapes. `pending` omits
+already-known and proven superseded revisions and reports new tags and removed
+bookmarks separately.

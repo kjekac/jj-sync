@@ -672,7 +672,7 @@ fn protocol_cycles_fetch_cache_filter_catalog_and_preserve_offline_state() {
         String::from_utf8_lossy(&dry_run.stderr)
     );
     let output = String::from_utf8(dry_run.stdout).unwrap();
-    assert!(output.contains("History:"));
+    assert!(output.contains("Resulting history"));
     assert!(!output.contains("elided revisions"));
     assert!(!output.contains("archive/nixos"));
     assert!(
@@ -1205,7 +1205,39 @@ fn surgery_snapshots_stay_isolated_until_explicit_application() {
                 )
                 .is_empty());
         }
-        sync.apply(&target, true).unwrap();
+        let config = fixture.path("split-cli.json");
+        fs::write(&config, serde_json::to_string(&sync.config).unwrap()).unwrap();
+        let result = Command::new(env!("CARGO_BIN_EXE_jj-sync"))
+            .arg("--config")
+            .arg(&config)
+            .args(["apply", "--dry-run", "--cached", "--json", "--path"])
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        // Git transport may omit cross-change evolution edges. Every split
+        // part must still be represented with its actual change ID and parents.
+        for revision in heads.lines() {
+            let incoming = report["revisions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["commit_id"] == revision)
+                .expect("split part missing from preview");
+            let actual = fixture.jj(
+                &source,
+                &["log", "-r", revision, "--no-graph", "-T", "json(self)"],
+                false,
+            );
+            let actual: serde_json::Value = serde_json::from_str(&actual).unwrap();
+            assert_eq!(incoming["change_id"], actual["change_id"]);
+            assert_eq!(incoming["parents"], actual["parents"]);
+        }
         assert_eq!(fixture.commit(&target, "@"), local);
         sync.apply(&target, false).unwrap();
         assert_eq!(
@@ -1316,5 +1348,141 @@ fn peer_echoes_are_quiet_but_independent_edits_tags_and_deletions_are_pending() 
     peer.snapshot(&replica, false).unwrap();
     writer.cycle().unwrap();
     assert_eq!(writer.pending(&source).unwrap(), 1);
+    std::env::remove_var("GIT_SSH_VARIANT");
+}
+
+#[test]
+fn structured_preview_pairs_rewrites_and_keeps_descendants_available_without_checking_them_out() {
+    let fixture = Fixture::new();
+    let mut sync = fixture.sync();
+    let source = fixture.repo("remote-dev/project", false);
+    let target = fixture.repo("dev/project", false);
+    let mut remote = fixture.sync();
+    remote.config.host = "remover".into();
+    remote.config.state = fixture.path("remote-state");
+    remote
+        .config
+        .repository_roots
+        .insert("dev".into(), fixture.path("remote-dev"));
+    fixture.jj(&source, &["bookmark", "set", "base"], false);
+    let base = fixture.commit(&source, "@");
+    fixture.jj(&source, &["tag", "set", "deployed-base"], false);
+    fixture.jj(&source, &["new", "-m", "Alacritty"], true);
+    fs::write(source.join("alacritty"), "local network access\n").unwrap();
+    fixture.jj(&source, &["bookmark", "set", "alacritty"], true);
+    let alacritty_old = fixture.commit(&source, "@");
+    fixture.jj(&source, &["new", "-m", "Staging"], true);
+    fixture.jj(&source, &["bookmark", "set", "staging"], false);
+    remote.snapshot(&source, false).unwrap();
+    sync.tools.ssh = transport(&fixture, &remote.config);
+    std::env::set_var("GIT_SSH_VARIANT", "ssh");
+    sync.accept_key("remover", &remote.public_key().unwrap())
+        .unwrap();
+    sync.cycle().unwrap();
+    sync.apply(&target, false).unwrap();
+    let old_tip = fixture.commit(&source, "@");
+    fixture.jj(&target, &["edit", &old_tip], true);
+    fixture.jj(&source, &["rebase", "-r", "staging", "-d", &base], true);
+    fixture.jj(
+        &source,
+        &["rebase", "-r", "alacritty", "-d", "staging"],
+        true,
+    );
+    let new_tip = fixture.commit(&source, "staging");
+    let alacritty_new = fixture.commit(&source, "alacritty");
+    remote.snapshot(&source, false).unwrap();
+    sync.cycle().unwrap();
+    let config = fixture.path("cli.json");
+    fs::write(&config, serde_json::to_string(&sync.config).unwrap()).unwrap();
+    let cli = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_jj-sync"))
+            .arg("--config")
+            .arg(&config)
+            .args(args)
+            .arg("--cached")
+            .arg("--path")
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let pending = cli(&["pending", "--json"]);
+    let pending: serde_json::Value = serde_json::from_slice(&pending.stdout).unwrap();
+    assert!(!pending["peers"]["remover"]["revisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["commit_id"] == base));
+    let result = cli(&["apply", "--dry-run", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["workspace"]["before"], old_tip);
+    assert_eq!(report["workspace"]["after"], new_tip);
+    assert_eq!(report["workspace"]["files"][0]["path"], "alacritty");
+    assert_eq!(report["workspace"]["files"][0]["status"], "removed");
+    let change = report["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| {
+            c["before"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(alacritty_old))
+        })
+        .unwrap();
+    assert!(change["after"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(alacritty_new)));
+    assert_eq!(change["kind"], "rewritten");
+    assert!(report["workspace"]["available_outside_ancestry"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["commit_id"] == alacritty_new));
+    assert_eq!(fixture.commit(&target, "@"), old_tip);
+    assert!(target.join("alacritty").exists());
+    let terminal = cli(&["apply", "--dry-run", "--color", "always"]);
+    let terminal = String::from_utf8(terminal.stdout).unwrap();
+    assert!(terminal.contains("\x1b["));
+    assert!(!terminal.contains(".tmp"), "{terminal}");
+    assert!(terminal.contains("Alacritty"));
+    // The Nu commands return records, and ^ still selects the executable.
+    let module = Path::new(env!("CARGO_MANIFEST_DIR")).join("nushell/jj-sync-commands.nu");
+    let script = format!("use {} *; let p = (jj-sync pending --cached --config {} --path {}); if ($p | first | get peer) != 'remover' {{ error make {{msg: 'missing peer'}} }}; let r = (jj-sync apply --dry-run --cached --config {} --path {}); if $r.workspace.after != '{}' {{ error make {{msg: 'wrong checkout'}} }}; ^jj-sync --version", quote(&module), quote(&config), quote(&target), quote(&config), quote(&target), new_tip);
+    let nu = Command::new("nu")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                Path::new(env!("CARGO_BIN_EXE_jj-sync"))
+                    .parent()
+                    .unwrap()
+                    .display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .args(["--no-config-file", "-c", &script])
+        .output()
+        .unwrap();
+    assert!(
+        nu.status.success(),
+        "{}",
+        String::from_utf8_lossy(&nu.stderr)
+    );
+    let applied = cli(&["apply", "--json"]);
+    let applied: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(applied["workspace"]["after"], new_tip);
+    assert_eq!(fixture.commit(&target, "@"), new_tip);
+    assert_eq!(
+        fixture.commit(&target, "alacritty@sync-remover"),
+        alacritty_new
+    );
+    assert!(!target.join("alacritty").exists());
     std::env::remove_var("GIT_SSH_VARIANT");
 }

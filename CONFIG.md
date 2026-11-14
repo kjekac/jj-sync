@@ -54,7 +54,7 @@ commits; JJ handles stale workspaces.
 snapshots into `state/staging/<peer>/<repository>`. Incoming updates affect
 those isolated repositories. Publication snapshots current working files.
 
-`pending` refreshes staging and lists peers, fetch errors and staged tips for
+`pending` refreshes staging and lists peers, fetch errors and incoming revisions for
 this repository. `pending --cached` inspects downloaded snapshots offline.
 `pending --json` provides structured output. `pending --count --path DIR` reads
 cached status without refreshing or waiting for the cycle lock, for shell prompts.
@@ -66,8 +66,12 @@ change IDs alone do not establish that relationship. Independent edits, new
 deployment tags and removal of previously accepted bookmarks remain pending.
 
 `apply --dry-run` refreshes staging and prepares native JJ reconciliation in a
-disposable copy of local metadata and the Git store. It reports revisions added
-and retired, workspace content changes, conflicts and divergence. `--verbose`
+disposable copy of local metadata and the Git store. It pairs revisions by change ID, renders the proposed visible graph with JJ,
+and reports the checkout transition, file changes, conflicts and divergence.
+Incoming descendants remain available; apply follows the current change.
+`--json` returns a versioned report with full IDs, parent and evolution
+relationships, ref changes and workspace effects. The packaged Nushell module
+returns these reports as records; `^jj-sync` selects the terminal interface. `--verbose`
 includes the full native operation diff. `--preview` remains an alias for
 `--dry-run`. Local working files are snapshotted before preparing the copy.
 

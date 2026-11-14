@@ -18,7 +18,7 @@
     devShells = eachSystem (system: let
       pkgs = nixpkgs.legacyPackages.${system};
     in { default = pkgs.mkShell {
-      packages = [ pkgs.cargo pkgs.rustc pkgs.rustfmt pkgs.clippy pkgs.jujutsu pkgs.gitMinimal pkgs.openssh pkgs.python3 ];
+      packages = [ pkgs.cargo pkgs.rustc pkgs.rustfmt pkgs.clippy pkgs.jujutsu pkgs.gitMinimal pkgs.openssh pkgs.python3 pkgs.nushell ];
     }; });
   };
 }
