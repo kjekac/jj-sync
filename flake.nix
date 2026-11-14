@@ -8,13 +8,13 @@
   in {
     packages = eachSystem (system: let
       pkgs = nixpkgs.legacyPackages.${system};
-      package = pkgs.callPackage ./jj-repo-sync.nix { };
-    in { default = package; jj-repo-sync = package; } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+      package = pkgs.callPackage ./jj-sync.nix { };
+    in { default = package; jj-sync = package; } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
       native-cycle-check = pkgs.writeShellScriptBin "native-cycle-check" ''
-        exec ${pkgs.python3}/bin/python3 ${./tests/native-cycle.py} ${package}/bin/jj-repo-sync "$@"
+        exec ${pkgs.python3}/bin/python3 ${./tests/native-cycle.py} ${package}/bin/jj-sync "$@"
       '';
     });
-    checks = eachSystem (system: { inherit (self.packages.${system}) jj-repo-sync; });
+    checks = eachSystem (system: { inherit (self.packages.${system}) jj-sync; });
     devShells = eachSystem (system: let
       pkgs = nixpkgs.legacyPackages.${system};
     in { default = pkgs.mkShell {

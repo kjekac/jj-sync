@@ -15,7 +15,7 @@ def main():
     if sys.platform != "darwin" or os.getuid() == 0:
         raise SystemExit("Run from a native macOS terminal or SSH session as the logged-in user, without sudo.")
     binary = sys.argv[1]
-    config = json.loads(Path("/etc/jj-repo-sync.json").read_text())
+    config = json.loads(Path("/etc/jj-sync.json").read_text())
     if not config["peers"]:
         raise SystemExit("The installed configuration has no peers to check.")
     # Reuse only the installed SSH client configuration, whose IdentityFile and
@@ -23,7 +23,7 @@ def main():
     # are temporary. No public key is enrolled on either machine.
     config["repositories"] = []
     config.pop("postFetchCommand", None)
-    label = "se.kjekac.jj-repo-sync-native-check-" + uuid.uuid4().hex
+    label = "se.kjekac.jj-sync-native-check-" + uuid.uuid4().hex
     domain = f"gui/{os.getuid()}"
     with tempfile.TemporaryDirectory(prefix="jj-native-cycle-") as directory:
         root = Path(directory)
@@ -43,7 +43,7 @@ def main():
             "StandardOutPath": str(stdout), "StandardErrorPath": str(stderr),
         }))
         print("Testing the production Rust binary with an empty repository allowlist.", flush=True)
-        print("Approve JJ Repo Sync in the machine's GUI if prompted. Waiting for three successful scheduled passes.", flush=True)
+        print("Approve JJ Sync in the machine's GUI if prompted. Waiting for three successful scheduled passes.", flush=True)
         subprocess.run(["/usr/bin/codesign", "--verify", "--strict", binary], check=True)
         subprocess.run(["/bin/launchctl", "bootstrap", domain, str(plist)], check=True)
         try:

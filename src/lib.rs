@@ -125,10 +125,10 @@ impl Default for Tools {
                 .unwrap_or_else(|| name.into())
         }
         Self {
-            jj: locate(option_env!("JJ_REPO_SYNC_JJ"), "jj"),
-            git: locate(option_env!("JJ_REPO_SYNC_GIT"), "git"),
-            ssh: locate(option_env!("JJ_REPO_SYNC_SSH"), "ssh"),
-            keygen: locate(option_env!("JJ_REPO_SYNC_KEYGEN"), "ssh-keygen"),
+            jj: locate(option_env!("JJ_SYNC_JJ"), "jj"),
+            git: locate(option_env!("JJ_SYNC_GIT"), "git"),
+            ssh: locate(option_env!("JJ_SYNC_SSH"), "ssh"),
+            keygen: locate(option_env!("JJ_SYNC_KEYGEN"), "ssh-keygen"),
         }
     }
 }
@@ -152,6 +152,8 @@ pub struct StatusEntry {
     pub last_success: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<bool>,
 }
 pub type Status = BTreeMap<String, StatusEntry>;
 fn now() -> String {
@@ -274,7 +276,7 @@ impl Sync {
             let mut command = self.command(&self.tools.keygen);
             command
                 .args(["-q", "-t", "ed25519", "-N", "", "-C"])
-                .arg(format!("jj-repo-sync@{}", self.config.host))
+                .arg(format!("jj-sync@{}", self.config.host))
                 .arg("-f")
                 .arg(key);
             process::output(command, None, false)?;
@@ -450,7 +452,7 @@ impl Sync {
             .collect())
     }
     pub fn serve(&self, original: &str) -> Result<()> {
-        if original == "jj-repo-sync-list" {
+        if original == "jj-sync-list" {
             println!("{}", serde_json::to_string(&self.catalog()?)?);
             return Ok(());
         }
@@ -620,10 +622,271 @@ impl Sync {
         }
         Ok(())
     }
+    fn stage_refs(&self, stage: &Path, peer: &str) -> Result<String> {
+        self.jj(
+            stage,
+            &[
+                "bookmark",
+                "list",
+                "--remote",
+                &format!("sync-{peer}"),
+                "-T",
+                "if(!conflict, name ++ \"\\t\" ++ normal_target.commit_id() ++ \"\\n\")",
+            ],
+            false,
+            false,
+            false,
+        )
+    }
+    fn export_stage(&self, stage: &Path, peer: &str) -> Result<()> {
+        let refs = parse_pairs(&self.stage_refs(stage, peer)?, '\t')?;
+        let locals = self.jj(
+            stage,
+            &["bookmark", "list", "-T", "if(!remote, name ++ \"\\n\")"],
+            false,
+            false,
+            false,
+        )?;
+        for name in locals.lines().filter(|name| !refs.contains_key(*name)) {
+            self.jj(stage, &["bookmark", "delete", name], false, false, false)?;
+        }
+        for (name, revision) in refs {
+            self.jj(
+                stage,
+                &[
+                    "bookmark",
+                    "set",
+                    &name,
+                    "-r",
+                    &revision,
+                    "--allow-backwards",
+                ],
+                false,
+                false,
+                false,
+            )?;
+        }
+        self.jj(stage, &["git", "export"], false, false, false)?;
+        Ok(())
+    }
+    fn stage_fingerprint(&self, stage: &Path, peer: &str) -> Result<String> {
+        let tags = self.jj(
+            stage,
+            &[
+                "tag",
+                "list",
+                "--all-remotes",
+                "-T",
+                "name ++ \" \" ++ if(conflict, \"CONFLICT\", normal_target.commit_id()) ++ \"\\n\"",
+            ],
+            false,
+            false,
+            false,
+        )?;
+        Ok(format!("{}\n{}", self.stage_refs(stage, peer)?, tags))
+    }
+    fn accepted_path(&self, peer: &str, id: &RepositoryId) -> PathBuf {
+        self.config
+            .state
+            .join("accepted")
+            .join(peer)
+            .join(format!("{}.json", id.0))
+    }
+    fn pending_stage(&self, stage: &Path, peer: &str, id: &RepositoryId) -> Result<bool> {
+        Ok(
+            fs::read_to_string(self.accepted_path(peer, id)).unwrap_or_default()
+                != self.stage_fingerprint(stage, peer)?,
+        )
+    }
+    pub fn pending(&self, path: &Path) -> Result<usize> {
+        let status = self.read_status()?;
+        let path = path.canonicalize()?;
+        let mut count = 0;
+        for (key, entry) in status {
+            if entry.pending != Some(true) {
+                continue;
+            }
+            if let Some((_, id)) = key.split_once('/') {
+                if let Some((root, relative)) = id.split_once('/') {
+                    if let Some(base) = self.config.repository_roots.get(root) {
+                        if let Ok(repository) = base.join(relative).canonicalize() {
+                            if path.starts_with(repository) {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+    pub fn read_status(&self) -> Result<Status> {
+        let file = self.config.state.join("status.json");
+        if file.exists() {
+            Ok(serde_json::from_str(&fs::read_to_string(file)?)?)
+        } else {
+            Ok(BTreeMap::new())
+        }
+    }
+    /// Apply only snapshots already downloaded by cycle. No network operations.
+    pub fn apply(&self, path: &Path, preview: bool) -> Result<()> {
+        let path = path.canonicalize()?;
+        let repos = self.discover()?;
+        let (id, repo) = repos
+            .iter()
+            .filter(|(_, repo)| repo.jj)
+            .find(|(_, repo)| path.starts_with(&repo.path))
+            .context("Current directory is not an allowlisted JJ repository")?;
+        self.jj(&repo.path, &["status"], true, false, false)?;
+        let baseline = self.jj(
+            &repo.path,
+            &["op", "log", "--limit", "1", "--no-graph", "-T", "id"],
+            false,
+            false,
+            false,
+        )?;
+        let preview_path = self
+            .config
+            .state
+            .join("previews")
+            .join(format!("{}.json", id.0));
+        let mut fingerprints = BTreeMap::new();
+        for peer in self.config.peers.keys() {
+            let stage = self.config.state.join("staging").join(peer).join(&id.0);
+            if stage.join(".jj").exists() {
+                fingerprints.insert(peer.clone(), self.stage_fingerprint(&stage, peer)?);
+            }
+        }
+        let token = serde_json::to_string(&(baseline.clone(), &fingerprints))?;
+        if !preview && preview_path.exists() {
+            ensure!(
+                fs::read_to_string(&preview_path)? == token,
+                "Local history or staged updates changed since preview; run apply --preview again"
+            );
+        }
+        let before_tip = self.jj(
+            &repo.path,
+            &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+            false,
+            false,
+            false,
+        )?;
+        let isolated;
+        let target = if preview {
+            isolated = tempfile::tempdir()?;
+            copy_directory(&repo.path.join(".jj"), &isolated.path().join(".jj"))?;
+            let directory = self.jj(&repo.path, &["git", "root"], false, false, false)?;
+            let git = isolated.path().join("git-store");
+            copy_directory(Path::new(&directory), &git)?;
+            fs::write(
+                isolated.path().join(".jj/repo/store/git_target"),
+                git.to_str().context("Non UTF-8 Git path")?,
+            )?;
+            isolated.path().to_path_buf()
+        } else {
+            repo.path.clone()
+        };
+        for peer in self.config.peers.keys() {
+            let stage = self.config.state.join("staging").join(peer).join(&id.0);
+            if !stage.join(".jj").exists() || !self.pending_stage(&stage, peer, id)? {
+                continue;
+            }
+            let name = format!("sync-{peer}");
+            let url = self.jj(&stage, &["git", "root"], false, false, false)?;
+            let remotes = parse_pairs(
+                &self.jj(&target, &["git", "remote", "list"], false, false, false)?,
+                ' ',
+            )?;
+            if let Some(old) = remotes.get(&name) {
+                ensure!(
+                    old == &url || old == &format!("ssh://{peer}/{}", id.0),
+                    "Unexpected URL for {name}"
+                );
+                self.jj(
+                    &target,
+                    &["git", "remote", "set-url", &name, &url],
+                    false,
+                    false,
+                    false,
+                )?;
+            }
+            self.ensure_remote(&target, &name, &url)?;
+            let args = [
+                "git", "fetch", "--remote", &name, "--branch", "glob:*", "--tag", "glob:*",
+            ];
+            let result = self.jj(&target, &args, !preview, false, false)?;
+            println!("{peer}: {result}");
+            if !preview {
+                if let Some(hook) = &self.config.post_fetch_command {
+                    let mut command = self.command(hook);
+                    command.arg(&target);
+                    process::output(command, None, false)?;
+                }
+                write_atomic(
+                    &self.accepted_path(peer, id),
+                    &self.stage_fingerprint(&stage, peer)?,
+                )?;
+            }
+        }
+        println!(
+            "History changes:\n{}",
+            self.jj(
+                &target,
+                &["op", "diff", "--from", &baseline, "--to", "@"],
+                false,
+                false,
+                false
+            )?
+        );
+        println!(
+            "Workspace content changes:\n{}",
+            self.jj(
+                &target,
+                &["diff", "--from", &before_tip, "--to", "@", "--stat"],
+                false,
+                false,
+                false
+            )?
+        );
+        if preview {
+            write_atomic(&preview_path, &token)?;
+        } else if preview_path.exists() {
+            fs::remove_file(&preview_path)?;
+        }
+        println!(
+            "{}",
+            self.jj(
+                &target,
+                &[
+                    "log",
+                    "-r",
+                    "ancestors(@ | remote_bookmarks(remote=glob:sync-*), 12) | divergent()",
+                    "--limit",
+                    "30"
+                ],
+                false,
+                false,
+                false
+            )?
+        );
+        if !preview {
+            let mut status = self.read_status()?;
+            for peer in self.config.peers.keys() {
+                if let Some(entry) = status.get_mut(&format!("{peer}/{}", id.0)) {
+                    entry.pending = Some(false);
+                }
+            }
+            write_atomic(
+                &self.config.state.join("status.json"),
+                &(serde_json::to_string_pretty(&status)? + "\n"),
+            )?;
+        }
+        Ok(())
+    }
     pub fn sync_peer(
         &self,
         peer: &str,
-        local: &BTreeMap<RepositoryId, Repository>,
+        _local: &BTreeMap<RepositoryId, Repository>,
         status: &mut Status,
     ) -> Result<()> {
         if !self
@@ -646,7 +909,7 @@ impl Sync {
         command
             .arg("-F")
             .arg(&self.config.ssh_config)
-            .args([peer, "jj-repo-sync-list"]);
+            .args([peer, "jj-sync-list"]);
         let mut catalog: Catalog = serde_json::from_str(&process::output(command, None, false)?)
             .context("Invalid peer repository catalog")?;
         catalog.retain(|id, _| self.config.repositories.contains(id));
@@ -658,18 +921,13 @@ impl Sync {
         for id in catalog.keys() {
             let entry = status.entry(format!("{peer}/{}", id.0)).or_default();
             let result = (|| -> Result<PathBuf> {
-                let target = if let Some(repo) = local.get(id).filter(|repo| repo.jj) {
-                    repo.path.clone()
-                } else {
-                    let target = self.config.state.join("repos").join(peer).join(&id.0);
-                    if !target.join(".jj").exists() {
-                        fs::create_dir_all(target.parent().unwrap())?;
-                        let mut command = self.command(&self.tools.jj);
-                        command.args(["git", "init", "--no-colocate"]).arg(&target);
-                        process::output(command, None, false)?;
-                    }
-                    target
-                };
+                let target = self.config.state.join("staging").join(peer).join(&id.0);
+                if !target.join(".jj").exists() {
+                    fs::create_dir_all(target.parent().unwrap())?;
+                    let mut command = self.command(&self.tools.jj);
+                    command.args(["git", "init", "--no-colocate"]).arg(&target);
+                    process::output(command, None, false)?;
+                }
                 const ENCODE: &AsciiSet = &NON_ALPHANUMERIC
                     .remove(b'/')
                     .remove(b'-')
@@ -678,6 +936,8 @@ impl Sync {
                     .remove(b'~');
                 let url = format!("ssh://{peer}/{}", utf8_percent_encode(&id.0, ENCODE));
                 self.fetch(&target, &format!("sync-{peer}"), &url, true, false)?;
+                self.export_stage(&target, peer)?;
+                entry.pending = Some(self.pending_stage(&target, peer, id)?);
                 Ok(target)
             })();
             match result {
@@ -862,4 +1122,26 @@ mod parsing_tests {
         }
         assert!(request_words("git-upload\\\n-pack /dev/project").is_err());
     }
+}
+
+fn copy_directory(source: &Path, target: &Path) -> Result<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let destination = target.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            let resolved = entry.path().canonicalize()?;
+            if resolved.is_dir() {
+                copy_directory(&resolved, &destination)?;
+            } else {
+                fs::copy(resolved, destination)?;
+            }
+        } else if kind.is_dir() {
+            copy_directory(&entry.path(), &destination)?;
+        } else {
+            fs::copy(entry.path(), destination)?;
+        }
+    }
+    Ok(())
 }

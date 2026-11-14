@@ -4,7 +4,7 @@ fn main() {
         let path = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
             .join("macos/Info.plist");
         println!(
-            "cargo:rustc-link-arg-bin=jj-repo-sync=-Wl,-sectcreate,__TEXT,__info_plist,{}",
+            "cargo:rustc-link-arg-bin=jj-sync=-Wl,-sectcreate,__TEXT,__info_plist,{}",
             path.display()
         );
     }

@@ -1,17 +1,17 @@
 # Configuration
 
-Read configuration from `/etc/jj-repo-sync.json`, or pass `--config <path>`:
+Read configuration from `/etc/jj-sync.json`, or pass `--config <path>`:
 
 ```json
 {
   "host": "desktop",
   "home": "/home/alice",
-  "state": "/home/alice/.local/state/jj-repo-sync",
+  "state": "/home/alice/.local/state/jj-sync",
   "repositoryRoots": {"dev": "/home/alice/dev"},
   "repositories": ["dev/project"],
   "peers": {"laptop": {"address": "192.0.2.2", "sshAlias": "laptop"}},
-  "sshConfig": "/etc/jj-repo-sync-ssh.conf",
-  "remoteCommand": "/run/current-system/sw/bin/jj-repo-sync"
+  "sshConfig": "/etc/jj-sync-ssh.conf",
+  "remoteCommand": "/run/current-system/sw/bin/jj-sync"
 }
 ```
 
@@ -48,30 +48,45 @@ Peer bookmarks remain untracked. The helper sets
 when that remote has tracked bookmarks. Workspace markers advertise recorded
 commits; JJ handles stale workspaces.
 
-Fetching snapshots and refreshes the current workspace. Removing a commit's last
-published ref can cause readers to abandon it and rebase its children. After a
-split, inspect local descendants and rebase them explicitly if they need both
-parts. Independent edits remain available as divergence. Deployment tags and
-immutability rules protect the exact commits they reference.
+## Explicit application
+
+`cycle` publishes local workspace tips and named bookmarks, and fetches peer
+snapshots into `state/staging/<peer>/<repository>`. Incoming updates affect
+those isolated repositories. Publication snapshots current working files.
+
+`status --json` includes per-repository `pending` flags. `pending --path DIR`
+prints the pending peer count using cached status, suitable for shell prompts.
+At a coordinated handoff, run `apply --preview` in the receiving repository.
+It snapshots local files and prepares native JJ reconciliation in a disposable
+copy of its metadata and Git store. The preview shows fetch results, proposed
+history and workspace content changes. `apply` fetches staged refs locally,
+so it works offline. A saved preview is checked against local operation identity
+and staged refs; preview again if either changes. Preview is optional.
+
+Cycles and apply serialize through a helper lock. Native JJ owns conflicts,
+abandonment, divergence and handling of concurrent ordinary JJ operations.
+Multiple peers apply sequentially, with each success recorded for retry.
+Inspect dependent work after splits and use `jj op log` for recovery.
 
 ## SSH endpoint
 
-Provision a dedicated SSH daemon that forces `jj-repo-sync serve`, uses
+Provision a dedicated SSH daemon that forces `jj-sync serve`, uses
 `<state>/authorized_keys`, and prohibits shells, forwarding, PTYs, and SSH startup
-scripts. The handler accepts `jj-repo-sync-list` and `git-upload-pack` requests
+scripts. The handler accepts `jj-sync-list` and `git-upload-pack` requests
 for allowlisted repositories. Listing reads repository metadata without taking
 snapshots; schedule publication on each host.
 
 The dedicated client configuration must pin host keys and use `<state>/identity`
 with batch authentication, `IdentityAgent none`, and `IdentitiesOnly yes`.
 Regular SSH and GitHub authentication use the user's normal configuration.
-Pair with `jj-repo-sync pair <peer>` over normal SSH. The remote pairing command
+Pair with `jj-sync pair <peer>` over normal SSH. The remote pairing command
 `pair-receive <peer>` reads a public key from stdin and returns its own public key.
 
 ## State and hooks
 
 The state directory contains the sync `identity`, paired keys in `peers/`, the
-restricted `authorized_keys`, cached repositories in `repos/<peer>/<repository>`,
+restricted `authorized_keys`, staging repositories in `staging/<peer>/<repository>`, accepted fingerprints
+in `accepted/`, preview records in `previews/`,
 and `status.json`. A lock serializes local commands; the read-only server runs
 independently.
 

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use jj_repo_sync::{Config, Sync};
+use jj_sync::{Config, Sync};
 use std::{
     fs,
     io::{self, Read},
@@ -14,7 +14,7 @@ use std::{
     about = "Publish workspace tips and fetch peer repositories through Jujutsu"
 )]
 struct Args {
-    #[arg(long, default_value = "/etc/jj-repo-sync.json", global = true)]
+    #[arg(long, default_value = "/etc/jj-sync.json", global = true)]
     config: PathBuf,
     #[command(subcommand)]
     command: Action,
@@ -25,10 +25,29 @@ enum Action {
     Serve,
     Setup,
     PublicKey,
-    Pair { peer: String },
-    PairReceive { peer: String },
-    Revoke { peer: String },
-    Status,
+    Pair {
+        peer: String,
+    },
+    PairReceive {
+        peer: String,
+    },
+    Revoke {
+        peer: String,
+    },
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Pending {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
+    Apply {
+        #[arg(long)]
+        preview: bool,
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
     Github,
 }
 fn execute(args: Args) -> Result<()> {
@@ -38,6 +57,10 @@ fn execute(args: Args) -> Result<()> {
     )?);
     if matches!(args.command, Action::Serve) {
         return sync.serve(&std::env::var("SSH_ORIGINAL_COMMAND").unwrap_or_default());
+    }
+    if let Action::Pending { path } = &args.command {
+        println!("{}", sync.pending(path)?);
+        return Ok(());
     }
     let _lock = sync.lock()?;
     match args.command {
@@ -58,7 +81,9 @@ fn execute(args: Args) -> Result<()> {
         }
         Action::Revoke { peer } => sync.revoke(&peer),
         Action::Github => sync.github(),
-        Action::Status => {
+        Action::Apply { path, preview } => sync.apply(&path, preview),
+        Action::Pending { .. } => unreachable!(),
+        Action::Status { json: _ } => {
             let path = sync.config.state.join("status.json");
             if path.exists() {
                 print!("{}", fs::read_to_string(path)?);
@@ -71,10 +96,10 @@ fn execute(args: Args) -> Result<()> {
     }
 }
 fn main() -> ExitCode {
-    let _signals = match jj_repo_sync::install_signal_handlers() {
+    let _signals = match jj_sync::install_signal_handlers() {
         Ok(handlers) => handlers,
         Err(error) => {
-            eprintln!("jj-repo-sync: {error:#}");
+            eprintln!("jj-sync: {error:#}");
             return ExitCode::FAILURE;
         }
     };
@@ -84,8 +109,8 @@ fn main() -> ExitCode {
     match execute(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("jj-repo-sync: {error:#}");
-            let signal = jj_repo_sync::received_signal();
+            eprintln!("jj-sync: {error:#}");
+            let signal = jj_sync::received_signal();
             if signal != 0 {
                 return ExitCode::from((128 + signal) as u8);
             }
@@ -94,7 +119,7 @@ fn main() -> ExitCode {
             #[cfg(target_os = "macos")]
             if cycle {
                 while start.elapsed() < std::time::Duration::from_secs(30) {
-                    let signal = jj_repo_sync::received_signal();
+                    let signal = jj_sync::received_signal();
                     if signal != 0 {
                         return ExitCode::from((128 + signal) as u8);
                     }

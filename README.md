@@ -1,11 +1,12 @@
-# jj-repo-sync
+# jj-sync
 
 A Rust CLI that publishes unfinished Jujutsu work and fetches it between
 allowlisted repositories on paired machines. Requires JJ 0.47.1 or newer.
 
 `cycle` snapshots local working copies, publishes `hosts/<host>/work/<workspace>`
-bookmarks, and fetches peers through read-only SSH. JJ handles rewrites, rebases,
-abandonment, and divergence. Fetching can change ancestry and working files.
+bookmarks, and downloads peer snapshots into isolated staging repositories through read-only SSH.
+Explicit `apply` uses native JJ reconciliation, including rewrites, rebases,
+abandonment, conflicts and divergence.
 Bookmark parked work to keep it published, and use one editing machine per active
 change.
 
@@ -13,7 +14,7 @@ change.
 
 Build with `nix build`, or run `nix run . -- --help`. Configure the tool and its
 SSH endpoint as described in [CONFIG.md](CONFIG.md), then schedule
-`jj-repo-sync cycle` on each machine.
+`jj-sync cycle` on each machine.
 
 | Command | Purpose |
 | --- | --- |
@@ -21,7 +22,10 @@ SSH endpoint as described in [CONFIG.md](CONFIG.md), then schedule
 | `public-key` | Print its public key. |
 | `pair <peer>` | Exchange sync keys over normal authenticated SSH. |
 | `revoke <peer>` | Remove a peer's sync key. |
-| `cycle` | Publish local work and fetch peers. |
+| `cycle` | Publish local work and stage peer snapshots. |
+| `apply --preview` | Preview native JJ reconciliation in a disposable copy. |
+| `apply` | Reconcile staged updates into the current repository. |
+| `pending --path DIR` | Print a cached pending-peer count for the directory. |
 | `status` | Print the latest saved cycle results. |
 | `github` | Back up host bookmarks and tags to an existing GitHub remote. |
 
@@ -36,7 +40,7 @@ fails.
 
 ## macOS
 
-Allow **JJ Repo Sync** in Privacy & Security > Local Network from the machine's
+Allow **JJ Sync** in Privacy & Security > Local Network from the machine's
 graphical session. The executable embeds its permission identity and usage
 description. Failed cycles stay alive for at least 30 seconds so the permission
 alert can appear. Nix ad-hoc signs the executable; permission may need renewed
@@ -61,3 +65,18 @@ nix develop -c cargo fmt --check
 ```
 
 Tests use disposable repositories and isolated configuration, state, and transport.
+
+At a coordinated development handoff, inspect and apply pending updates:
+
+```sh
+jj-sync status --json
+jj-sync apply --preview
+jj-sync apply
+jj status
+jj log
+```
+
+Background cycles keep the receiving history ready for explicit application.
+Coordinate the checkpoint with the editing host. Check conflicts, divergence,
+and dependent work after applying. The Nushell prompt supplied by nix-config
+shows `↓sync:N` when peers have pending snapshots for the current repository.

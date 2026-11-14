@@ -194,7 +194,7 @@ mod tests {
     use super::*;
     static SIGNAL_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn shell(script: &str) -> Command {
-        let mut command = Command::new(option_env!("JJ_REPO_SYNC_SHELL").unwrap_or("/bin/sh"));
+        let mut command = Command::new(option_env!("JJ_SYNC_SHELL").unwrap_or("/bin/sh"));
         command.args(["-c", script]);
         command
     }

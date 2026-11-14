@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>CFBundleIdentifier</key><string>se.kjekac.jj-repo-sync</string>
-  <key>CFBundleName</key><string>JJ Repo Sync</string>
-  <key>CFBundleExecutable</key><string>jj-repo-sync</string>
+  <key>CFBundleIdentifier</key><string>se.kjekac.jj-sync</string>
+  <key>CFBundleName</key><string>JJ Sync</string>
+  <key>CFBundleExecutable</key><string>jj-sync</string>
   <key>NSLocalNetworkUsageDescription</key>
-  <string>JJ Repo Sync fetches repositories from paired computers on your local network.</string>
+  <string>JJ Sync fetches repositories from paired computers on your local network.</string>
 </dict></plist>

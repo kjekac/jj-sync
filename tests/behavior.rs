@@ -1,4 +1,4 @@
-use jj_repo_sync::{write_atomic, Config, Repository, RepositoryId, Status, Sync, Tools};
+use jj_sync::{write_atomic, Config, Repository, RepositoryId, Status, Sync, Tools};
 use serde_json::json;
 use std::{
     fs,
@@ -48,7 +48,7 @@ impl Fixture {
                 "repositoryRoots": {"dev": path.join("dev")},
                 "repositories": ["dev/project", "dev/extra", "dev/jj", "dev/git"],
                 "peers": {"remover": {"address": "localhost", "sshAlias": "remover"}},
-                "sshConfig": path.join("ssh.conf"), "remoteCommand": "/bin/jj-repo-sync"
+                "sshConfig": path.join("ssh.conf"), "remoteCommand": "/bin/jj-sync"
             })
             .to_string(),
         )
@@ -110,10 +110,7 @@ impl Fixture {
             &path,
             contents.replacen(
                 "#!/bin/sh",
-                &format!(
-                    "#!{}",
-                    option_env!("JJ_REPO_SYNC_SHELL").unwrap_or("/bin/sh")
-                ),
+                &format!("#!{}", option_env!("JJ_SYNC_SHELL").unwrap_or("/bin/sh")),
                 1,
             ),
         )
@@ -476,7 +473,7 @@ fn restricted_server_rejects_shells_writes_traversal_and_extra_arguments() {
         "",
         "bash",
         "git-receive-pack '/dev/project'",
-        "jj-repo-sync-list; id",
+        "jj-sync-list; id",
         "git-upload-pack /dev/project # ignored extra arguments",
         "git-upload-pack '/dev/../secret'",
         "git-upload-pack /etc",
@@ -576,7 +573,7 @@ fn post_fetch_hook_sees_imported_refs_and_failure_is_reported() {
         hook,
         format!(
             "#!{}\necho 'archive failed' >&2\nexit 1\n",
-            option_env!("JJ_REPO_SYNC_SHELL").unwrap_or("/bin/sh")
+            option_env!("JJ_SYNC_SHELL").unwrap_or("/bin/sh")
         ),
     )
     .unwrap();
@@ -590,7 +587,7 @@ fn post_fetch_hook_sees_imported_refs_and_failure_is_reported() {
 fn transport(fixture: &Fixture, remote_config: &Config) -> PathBuf {
     let config_file = fixture.path("remote.json");
     fs::write(&config_file, serde_json::to_string(remote_config).unwrap()).unwrap();
-    fixture.script("fake-ssh", &format!("#!/bin/sh\nfor last do :; done\nexport SSH_ORIGINAL_COMMAND=\"$last\"\nexec {} --config {} serve\n", shell_words::quote(env!("CARGO_BIN_EXE_jj-repo-sync")), quote(&config_file)))
+    fixture.script("fake-ssh", &format!("#!/bin/sh\nfor last do :; done\nexport SSH_ORIGINAL_COMMAND=\"$last\"\nexec {} --config {} serve\n", shell_words::quote(env!("CARGO_BIN_EXE_jj-sync")), quote(&config_file)))
 }
 
 #[test]
@@ -643,18 +640,51 @@ fn protocol_cycles_fetch_cache_filter_catalog_and_preserve_offline_state() {
     assert!(!status.contains_key("remover/dev/private"));
     assert!(!status.contains_key("local/dev/gone"));
     assert_eq!(fixture.commit(&target, "@"), before);
+    assert_eq!(sync.pending(&target).unwrap(), 1);
+    let before_operation = fixture.jj(
+        &target,
+        &["op", "log", "--limit", "1", "--no-graph", "-T", "id"],
+        false,
+    );
+    sync.apply(&target, true).unwrap();
+    assert_eq!(fixture.commit(&target, "@"), before);
+    assert_eq!(
+        fixture.jj(
+            &target,
+            &["op", "log", "--limit", "1", "--no-graph", "-T", "id"],
+            false
+        ),
+        before_operation
+    );
+    fixture.jj(
+        &target,
+        &["describe", "-m", "Local change after preview"],
+        true,
+    );
+    assert!(sync
+        .apply(&target, false)
+        .unwrap_err()
+        .to_string()
+        .contains("changed since preview"));
+    sync.apply(&target, true).unwrap();
+    sync.apply(&target, false).unwrap();
+    assert_eq!(sync.pending(&target).unwrap(), 0);
     assert_eq!(
         fixture.commit(&target, "hosts/remover/work/default@sync-remover"),
         fixture.commit(&source, "@")
     );
-    let cached = sync.config.state.join("repos/remover/dev/extra");
+    let cached = sync.config.state.join("staging/remover/dev/extra");
     let revision = fixture.commit(&extra, "@");
     assert_eq!(
         fixture.commit(&cached, "hosts/remover/work/default@sync-remover"),
         revision
     );
     assert!(!fixture.path("dev/extra").exists());
-    assert!(!sync.config.state.join("repos/remover/dev/private").exists());
+    assert!(!sync
+        .config
+        .state
+        .join("staging/remover/dev/private")
+        .exists());
     fs::rename(extra, fixture.path("removed-extra")).unwrap();
     sync.cycle().unwrap();
     let status: Status =
@@ -684,7 +714,7 @@ fn cli_preserves_config_status_pairing_and_reports_cycle_failure() {
     let file = fixture.path("config.json");
     fs::write(&file, serde_json::to_string(&fixture.config).unwrap()).unwrap();
     let call = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_jj-repo-sync"))
+        Command::new(env!("CARGO_BIN_EXE_jj-sync"))
             .arg("--config")
             .arg(&file)
             .args(args)
@@ -745,7 +775,7 @@ fn two_host_cycles_preserve_independent_work_across_rebases_and_deployments() {
             .unwrap();
             let ssh = fixture.script(&format!("{name}/ssh"), &format!(
                 "#!/bin/sh\nlast=\nprevious=\nfor arg do previous=$last; last=$arg; done\ncase \"$previous\" in thastrom) config={};; remover) config={};; *) exit 1;; esac\nexport SSH_ORIGINAL_COMMAND=\"$last\"\nexec {} --config \"$config\" serve\n",
-                quote(&writer_config), quote(&reader_config), shell_words::quote(env!("CARGO_BIN_EXE_jj-repo-sync"))));
+                quote(&writer_config), quote(&reader_config), shell_words::quote(env!("CARGO_BIN_EXE_jj-sync"))));
             writer.tools.ssh = ssh.clone();
             reader.tools.ssh = ssh;
             std::env::set_var("GIT_SSH_VARIANT", "ssh");
@@ -762,6 +792,7 @@ fn two_host_cycles_preserve_independent_work_across_rebases_and_deployments() {
             let old = fixture.commit(&source, "@");
             writer.cycle().unwrap();
             reader.cycle().unwrap();
+            reader.apply(&target, false).unwrap();
             fixture.jj(
                 &target,
                 &[
@@ -799,6 +830,15 @@ fn two_host_cycles_preserve_independent_work_across_rebases_and_deployments() {
             for _ in 0..3 {
                 writer.cycle().unwrap();
                 reader.cycle().unwrap();
+                // Background staging cannot rebase the active feature.
+                if fixture.commit(&target, "@") == feature {
+                    assert_eq!(
+                        fixture.commit(&target, "@-"),
+                        if dependent { old.clone() } else { base.clone() }
+                    );
+                }
+                reader.apply(&target, true).unwrap();
+                reader.apply(&target, false).unwrap();
                 assert_eq!(fixture.commit(&target, "@") != feature, dependent);
                 assert_eq!(
                     fixture.jj(
@@ -1026,4 +1066,102 @@ fn snapshot_uses_local_feature_when_tracked_remote_differs() {
             false
         )
         .is_empty());
+}
+
+#[test]
+fn surgery_snapshots_stay_isolated_until_explicit_application() {
+    let fixture = Fixture::new();
+    for mode in ["serial", "parallel", "onto"] {
+        let mut sync = fixture.sync();
+        sync.config.state = fixture.path(&format!("state-{mode}"));
+        sync.config
+            .repository_roots
+            .insert("dev".into(), fixture.path(&format!("local-{mode}")));
+        let target = fixture.repo(&format!("local-{mode}/project"), true);
+        let source = fixture.repo(&format!("remote-{mode}/project"), false);
+        let mut remote = fixture.sync();
+        remote.config.host = "remover".into();
+        remote.config.state = fixture.path(&format!("remote-state-{mode}"));
+        remote
+            .config
+            .repository_roots
+            .insert("dev".into(), fixture.path(&format!("remote-{mode}")));
+        sync.tools.ssh = transport(&fixture, &remote.config);
+        std::env::set_var("GIT_SSH_VARIANT", "ssh");
+        sync.accept_key("remover", &remote.public_key().unwrap())
+            .unwrap();
+        fs::write(source.join("other"), "second part").unwrap();
+        remote.snapshot(&source, false).unwrap();
+        sync.cycle().unwrap();
+        sync.apply(&target, false).unwrap();
+        let old = fixture.commit(&source, "@");
+        fixture.jj(
+            &target,
+            &["new", &old, "-m", "Independent local work"],
+            true,
+        );
+        fs::write(target.join("local"), "keep local edits").unwrap();
+        fixture.jj(&target, &["status"], true);
+        let local = fixture.commit(&target, "@");
+        let mut args = vec!["split", "-m", "First part"];
+        if mode == "parallel" {
+            args.push("--parallel");
+        }
+        if mode == "onto" {
+            args.extend(["--onto", "root()"]);
+        }
+        args.push("root:file");
+        fixture.jj(&source, &args, true);
+        let heads = fixture.jj(
+            &source,
+            &[
+                "log",
+                "-r",
+                "heads(all())",
+                "--no-graph",
+                "-T",
+                "commit_id ++ \"\\n\"",
+            ],
+            false,
+        );
+        for (index, revision) in heads.lines().enumerate() {
+            fixture.jj(
+                &source,
+                &["bookmark", "set", &format!("part-{index}"), "-r", revision],
+                false,
+            );
+        }
+        for _ in 0..3 {
+            remote.snapshot(&source, false).unwrap();
+            sync.cycle().unwrap();
+            assert_eq!(fixture.commit(&target, "@"), local);
+            assert_eq!(fixture.commit(&target, "@-"), old);
+            assert_eq!(
+                fs::read_to_string(target.join("other")).unwrap(),
+                "second part"
+            );
+            assert!(fixture
+                .jj(
+                    &target,
+                    &["log", "-r", "divergent()", "--no-graph", "-T", "commit_id"],
+                    false
+                )
+                .is_empty());
+        }
+        sync.apply(&target, true).unwrap();
+        assert_eq!(fixture.commit(&target, "@"), local);
+        sync.apply(&target, false).unwrap();
+        assert_eq!(
+            fs::read_to_string(target.join("local")).unwrap(),
+            "keep local edits"
+        );
+        assert_eq!(sync.pending(&target).unwrap(), 0);
+        for (index, revision) in heads.lines().enumerate() {
+            assert_eq!(
+                fixture.commit(&target, &format!("part-{index}@sync-remover")),
+                revision
+            );
+        }
+        std::env::remove_var("GIT_SSH_VARIANT");
+    }
 }
