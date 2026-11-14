@@ -41,10 +41,23 @@ enum Action {
     Pending {
         #[arg(long, default_value = ".")]
         path: PathBuf,
+        /// Cached numeric output for shell prompts; never refreshes.
+        #[arg(long, conflicts_with = "json")]
+        count: bool,
+        #[arg(long)]
+        json: bool,
+        /// Inspect the last downloaded snapshots without contacting peers.
+        #[arg(long)]
+        cached: bool,
     },
     Apply {
+        #[arg(long = "dry-run", alias = "preview")]
+        dry_run: bool,
         #[arg(long)]
-        preview: bool,
+        cached: bool,
+        /// Include the full native JJ operation diff.
+        #[arg(long)]
+        verbose: bool,
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
@@ -58,7 +71,10 @@ fn execute(args: Args) -> Result<()> {
     if matches!(args.command, Action::Serve) {
         return sync.serve(&std::env::var("SSH_ORIGINAL_COMMAND").unwrap_or_default());
     }
-    if let Action::Pending { path } = &args.command {
+    if let Action::Pending {
+        path, count: true, ..
+    } = &args.command
+    {
         println!("{}", sync.pending(path)?);
         return Ok(());
     }
@@ -81,8 +97,27 @@ fn execute(args: Args) -> Result<()> {
         }
         Action::Revoke { peer } => sync.revoke(&peer),
         Action::Github => sync.github(),
-        Action::Apply { path, preview } => sync.apply(&path, preview),
-        Action::Pending { .. } => unreachable!(),
+        Action::Apply {
+            path,
+            dry_run,
+            cached,
+            verbose,
+        } => {
+            if !cached && (dry_run || !sync.has_preview(&path)?) {
+                sync.cycle()?;
+            }
+            sync.apply_with_details(&path, dry_run, verbose)
+        }
+        Action::Pending {
+            path, json, cached, ..
+        } => {
+            if !cached {
+                if let Err(error) = sync.cycle() {
+                    eprintln!("Refresh failed; showing cached results: {error:#}");
+                }
+            }
+            sync.show_pending(&path, json)
+        }
         Action::Status { json: _ } => {
             let path = sync.config.state.join("status.json");
             if path.exists() {

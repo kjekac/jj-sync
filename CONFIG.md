@@ -54,19 +54,28 @@ commits; JJ handles stale workspaces.
 snapshots into `state/staging/<peer>/<repository>`. Incoming updates affect
 those isolated repositories. Publication snapshots current working files.
 
-`status --json` includes per-repository `pending` flags. `pending --path DIR`
-prints the pending peer count using cached status, suitable for shell prompts.
-A snapshot containing only locally visible commits or proven predecessors of
-visible local changes is baselined without importing its refs. This prevents a
-peer's unchanged workspace marker from reintroducing your own superseded version.
-Matching change IDs alone do not establish that relationship. Independent edits,
-new deployment tags and removal of previously accepted bookmarks remain pending.
-At a coordinated handoff, run `apply --preview` in the receiving repository.
-It snapshots local files and prepares native JJ reconciliation in a disposable
-copy of its metadata and Git store. The preview shows fetch results, proposed
-history and workspace content changes. `apply` fetches staged refs locally,
-so it works offline. A saved preview is checked against local operation identity
-and staged refs; preview again if either changes. Preview is optional.
+`pending` refreshes staging and lists peers, fetch errors and staged tips for
+this repository. `pending --cached` inspects downloaded snapshots offline.
+`pending --json` provides structured output. `pending --count --path DIR` reads
+cached status without refreshing or waiting for the cycle lock, for shell prompts.
+`status --json` always reads the saved transport report for all repositories.
+
+Snapshots containing only locally visible commits or proven predecessors of
+visible local changes are baselined without importing stale refs. Matching
+change IDs alone do not establish that relationship. Independent edits, new
+deployment tags and removal of previously accepted bookmarks remain pending.
+
+`apply --dry-run` refreshes staging and prepares native JJ reconciliation in a
+disposable copy of local metadata and the Git store. It reports revisions added
+and retired, workspace content changes, conflicts and divergence. `--verbose`
+includes the full native operation diff. `--preview` remains an alias for
+`--dry-run`. Local working files are snapshotted before preparing the copy.
+
+`apply` consumes the snapshots inspected by the last dry-run. It checks local
+operation identity and staged refs, asking for another dry-run if either changed.
+Without a saved dry-run, apply refreshes staging first. Use `--cached` on dry-run
+or apply to operate offline. Refresh failure stops apply; pending reports the
+failure alongside cached results. Dry-run is optional.
 
 Cycles and apply serialize through a helper lock. Native JJ owns conflicts,
 abandonment, divergence and handling of concurrent ordinary JJ operations.

@@ -641,6 +641,57 @@ fn protocol_cycles_fetch_cache_filter_catalog_and_preserve_offline_state() {
     assert!(!status.contains_key("local/dev/gone"));
     assert_eq!(fixture.commit(&target, "@"), before);
     assert_eq!(sync.pending(&target).unwrap(), 1);
+    let cli_config = fixture.path("cli-config.json");
+    fs::write(&cli_config, serde_json::to_string(&sync.config).unwrap()).unwrap();
+    let cli = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_jj-sync"))
+            .arg("--config")
+            .arg(&cli_config)
+            .args(args)
+            .arg("--path")
+            .arg(&target)
+            .output()
+            .unwrap()
+    };
+    let counted = cli(&["pending", "--count"]);
+    assert!(counted.status.success());
+    assert_eq!(String::from_utf8(counted.stdout).unwrap().trim(), "1");
+    let human = cli(&["pending", "--cached"]);
+    assert!(human.status.success());
+    assert!(String::from_utf8(human.stdout)
+        .unwrap()
+        .contains("remover: updates staged"));
+    let machine = cli(&["pending", "--cached", "--json"]);
+    assert!(machine.status.success());
+    let machine: serde_json::Value = serde_json::from_slice(&machine.stdout).unwrap();
+    assert_eq!(machine["peers"]["remover"]["pending"], true);
+    let dry_run = cli(&["apply", "--dry-run", "--cached"]);
+    assert!(
+        dry_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    let output = String::from_utf8(dry_run.stdout).unwrap();
+    assert!(output.contains("History:"));
+    assert!(!output.contains("elided revisions"));
+    assert!(!output.contains("archive/nixos"));
+    assert!(
+        output.lines().count() < 40,
+        "Dry-run must remain concise: {output}"
+    );
+    let legacy = cli(&["apply", "--preview", "--cached"]);
+    assert!(legacy.status.success());
+    // Interactive pending performs a refresh and reports a clear pairing error.
+    let mut unpaired = sync.config.clone();
+    unpaired.state = fixture.path("unpaired-state");
+    fs::write(&cli_config, serde_json::to_string(&unpaired).unwrap()).unwrap();
+    let refresh = cli(&["pending"]);
+    assert!(refresh.status.success());
+    assert!(String::from_utf8(refresh.stdout)
+        .unwrap()
+        .contains("Not paired"));
+    assert!(unpaired.state.join("status.json").exists());
+    fs::write(&cli_config, serde_json::to_string(&sync.config).unwrap()).unwrap();
     let before_operation = fixture.jj(
         &target,
         &["op", "log", "--limit", "1", "--no-graph", "-T", "id"],
@@ -669,6 +720,12 @@ fn protocol_cycles_fetch_cache_filter_catalog_and_preserve_offline_state() {
     sync.apply(&target, true).unwrap();
     sync.apply(&target, false).unwrap();
     assert_eq!(sync.pending(&target).unwrap(), 0);
+    // Even an empty dry-run is a checkpoint, so later local edits invalidate it.
+    sync.apply(&target, true).unwrap();
+    fixture.jj(&target, &["describe", "-m", "Another local edit"], true);
+    assert!(sync.apply(&target, false).is_err());
+    sync.apply(&target, true).unwrap();
+    sync.apply(&target, false).unwrap();
     assert_eq!(
         fixture.commit(&target, "hosts/remover/work/default@sync-remover"),
         fixture.commit(&source, "@")

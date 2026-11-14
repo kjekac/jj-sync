@@ -23,9 +23,10 @@ SSH endpoint as described in [CONFIG.md](CONFIG.md), then schedule
 | `pair <peer>` | Exchange sync keys over normal authenticated SSH. |
 | `revoke <peer>` | Remove a peer's sync key. |
 | `cycle` | Publish local work and stage peer snapshots. |
-| `apply --preview` | Preview native JJ reconciliation in a disposable copy. |
+| `apply --dry-run` | Preview native JJ reconciliation in a disposable copy. |
 | `apply` | Reconcile staged updates into the current repository. |
-| `pending --path DIR` | Print a cached pending-peer count for the directory. |
+| `pending` | Refresh and summarize staged updates for this repository. |
+| `pending --count --path DIR` | Print a cached pending-peer count for a prompt. |
 | `status` | Print the latest saved cycle results. |
 | `github` | Back up host bookmarks and tags to an existing GitHub remote. |
 
@@ -69,14 +70,16 @@ Tests use disposable repositories and isolated configuration, state, and transpo
 At a coordinated development handoff, inspect and apply pending updates:
 
 ```sh
-jj-sync status --json
-jj-sync apply --preview
+jj-sync pending
+jj-sync apply --dry-run
 jj-sync apply
 jj status
 jj log
 ```
 
-Background cycles keep the receiving history ready for explicit application.
+`pending` and `apply --dry-run` refresh staging automatically. `apply` uses the
+snapshots from the dry-run; use `--cached` to work offline. `--verbose` adds the
+full operation diff. Background cycles keep history ready for application.
 Coordinate the checkpoint with the editing host. Check conflicts, divergence,
 and dependent work after applying. The Nushell prompt supplied by nix-config
 shows `↓sync:N` when peers have pending snapshots for the current repository.

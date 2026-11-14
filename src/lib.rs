@@ -822,8 +822,86 @@ impl Sync {
             Ok(BTreeMap::new())
         }
     }
+    fn local_repository(&self, path: &Path) -> Result<(RepositoryId, Repository)> {
+        let path = path.canonicalize()?;
+        self.discover()?
+            .into_iter()
+            .filter(|(_, repo)| repo.jj)
+            .find(|(_, repo)| path.starts_with(&repo.path))
+            .context("Current directory is not an allowlisted JJ repository")
+    }
+    pub fn has_preview(&self, path: &Path) -> Result<bool> {
+        let (id, _) = self.local_repository(path)?;
+        Ok(self
+            .config
+            .state
+            .join("previews")
+            .join(format!("{}.json", id.0))
+            .exists())
+    }
+    pub fn show_pending(&self, path: &Path, json: bool) -> Result<()> {
+        let (id, _) = self.local_repository(path)?;
+        let status = self.read_status()?;
+        let mut updates = BTreeMap::new();
+        for peer in self.config.peers.keys() {
+            let entry = status
+                .get(&format!("{peer}/{}", id.0))
+                .cloned()
+                .unwrap_or_default();
+            let error = status
+                .get(peer)
+                .and_then(|e| e.error.clone())
+                .or(entry.error.clone());
+            if !json {
+                let state = if entry.pending == Some(true) {
+                    "updates staged"
+                } else if entry.last_success.is_some() {
+                    "no staged updates"
+                } else {
+                    "not fetched yet"
+                };
+                println!(
+                    "{peer}: {state} (last fetch: {})",
+                    entry.last_success.as_deref().unwrap_or("never")
+                );
+                if let Some(error) = &error {
+                    println!("  Fetch error: {error}");
+                }
+                if entry.pending == Some(true) {
+                    let stage = self.config.state.join("staging").join(peer).join(&id.0);
+                    let refs = parse_pairs(&self.stage_refs(&stage, peer)?, '\t')?;
+                    let tips: BTreeSet<_> = refs.values().cloned().collect();
+                    if !tips.is_empty() {
+                        println!("{}", self.jj(&stage, &["log", "-r", &tips.into_iter().collect::<Vec<_>>().join(" | "), "--no-graph", "--limit", "8", "-T", "commit_id.short() ++ \" \" ++ description.first_line() ++ \"\\n\""], false, false, false)?);
+                    }
+                }
+            }
+            updates.insert(peer, serde_json::json!({"pending": entry.pending.unwrap_or(false), "lastSuccess": entry.last_success, "error": error}));
+        }
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"repository": id.0, "peers": updates})
+                )?
+            );
+        } else if updates.values().any(|e| e["pending"] == true) {
+            println!("Inspect with `jj-sync apply --dry-run`; then `jj-sync apply`.");
+        }
+        Ok(())
+    }
+    fn visible_revisions(&self, repo: &Path) -> Result<BTreeMap<String, String>> {
+        parse_pairs(&self.jj(repo, &["log", "-r", "all()", "--no-graph", "-T",
+            "commit_id ++ \"\\t\" ++ change_id.short() ++ \" \" ++ description.first_line() ++ \"\\n\""], false, false, false)?, '\t')
+    }
+    pub fn apply_with_details(&self, path: &Path, preview: bool, verbose: bool) -> Result<()> {
+        self.apply_inner(path, preview, verbose)
+    }
     /// Apply only snapshots already downloaded by cycle. No network operations.
     pub fn apply(&self, path: &Path, preview: bool) -> Result<()> {
+        self.apply_inner(path, preview, false)
+    }
+    fn apply_inner(&self, path: &Path, preview: bool, verbose: bool) -> Result<()> {
         let path = path.canonicalize()?;
         let repos = self.discover()?;
         let (id, repo) = repos
@@ -832,6 +910,14 @@ impl Sync {
             .find(|(_, repo)| path.starts_with(&repo.path))
             .context("Current directory is not an allowlisted JJ repository")?;
         self.jj(&repo.path, &["status"], true, false, false)?;
+        let mut pending_peers = BTreeSet::new();
+        for peer in self.config.peers.keys() {
+            let stage = self.config.state.join("staging").join(peer).join(&id.0);
+            if stage.join(".jj").exists() && self.pending_stage(&stage, peer, id)? {
+                pending_peers.insert(peer.clone());
+            }
+        }
+        let before_revisions = self.visible_revisions(&repo.path)?;
         let baseline = self.jj(
             &repo.path,
             &["op", "log", "--limit", "1", "--no-graph", "-T", "id"],
@@ -855,8 +941,17 @@ impl Sync {
         if !preview && preview_path.exists() {
             ensure!(
                 fs::read_to_string(&preview_path)? == token,
-                "Local history or staged updates changed since preview; run apply --preview again"
+                "Local history or staged updates changed since preview; run apply --dry-run again"
             );
+        }
+        if pending_peers.is_empty() {
+            if preview {
+                write_atomic(&preview_path, &token)?;
+            } else if preview_path.exists() {
+                fs::remove_file(&preview_path)?;
+            }
+            println!("No pending updates for {}.", id.0);
+            return Ok(());
         }
         let before_tip = self.jj(
             &repo.path,
@@ -908,8 +1003,11 @@ impl Sync {
             let args = [
                 "git", "fetch", "--remote", &name, "--branch", "glob:*", "--tag", "glob:*",
             ];
-            let result = self.jj(&target, &args, !preview, false, false)?;
-            println!("{peer}: {result}");
+            self.jj(&target, &args, !preview, false, false)?;
+            println!(
+                "{} staged update from {peer}.",
+                if preview { "Previewing" } else { "Applied" }
+            );
             if !preview {
                 if let Some(hook) = &self.config.post_fetch_command {
                     let mut command = self.command(hook);
@@ -922,16 +1020,40 @@ impl Sync {
                 )?;
             }
         }
+        let after_revisions = self.visible_revisions(&target)?;
+        let added: Vec<_> = after_revisions
+            .iter()
+            .filter(|(id, _)| !before_revisions.contains_key(*id))
+            .collect();
+        let removed: Vec<_> = before_revisions
+            .iter()
+            .filter(|(id, _)| !after_revisions.contains_key(*id))
+            .collect();
         println!(
-            "History changes:\n{}",
-            self.jj(
-                &target,
-                &["op", "diff", "--from", &baseline, "--to", "@"],
-                false,
-                false,
-                false
-            )?
+            "History: {} revisions added, {} retired.",
+            added.len(),
+            removed.len()
         );
+        for (label, rows) in [("+", &added), ("-", &removed)] {
+            for (id, description) in rows.iter().take(8) {
+                println!("  {label} {} {description}", &id[..12]);
+            }
+            if rows.len() > 8 {
+                println!("  … {} more (use --verbose)", rows.len() - 8);
+            }
+        }
+        if verbose {
+            println!(
+                "{}",
+                self.jj(
+                    &target,
+                    &["op", "diff", "--from", &baseline, "--to", "@", "--no-graph"],
+                    false,
+                    false,
+                    false
+                )?
+            );
+        }
         println!(
             "Workspace content changes:\n{}",
             self.jj(
@@ -947,22 +1069,33 @@ impl Sync {
         } else if preview_path.exists() {
             fs::remove_file(&preview_path)?;
         }
-        println!(
-            "{}",
-            self.jj(
+        for (label, revset) in [
+            ("Conflicts", "conflicts()"),
+            ("Divergence", "divergent() ~ immutable()"),
+        ] {
+            let affected = self.jj(
                 &target,
                 &[
                     "log",
                     "-r",
-                    "ancestors(@ | remote_bookmarks(remote=glob:sync-*), 12) | divergent()",
+                    revset,
+                    "--no-graph",
                     "--limit",
-                    "30"
+                    "8",
+                    "-T",
+                    "commit_id.short() ++ \" \" ++ description.first_line() ++ \"\\n\"",
                 ],
                 false,
                 false,
-                false
-            )?
-        );
+                false,
+            )?;
+            if !affected.is_empty() {
+                println!("{label} requiring review:\n{affected}");
+            }
+        }
+        if preview {
+            println!("Run `jj-sync apply` to accept this staged state.");
+        }
         if !preview {
             let mut status = self.read_status()?;
             for peer in self.config.peers.keys() {
