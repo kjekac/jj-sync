@@ -71,7 +71,12 @@ and reports the checkout transition, file changes, conflicts and divergence.
 Incoming descendants remain available; apply follows the current change.
 `--json` returns a versioned report with full IDs, parent and evolution
 relationships, ref changes and workspace effects. The packaged Nushell module
-returns these reports as records; `^jj-sync` selects the terminal interface. `--verbose`
+returns a compact structured summary by default. Nu `--details` (or `--json`)
+returns the full report; `^jj-sync` selects the terminal interface. Detailed
+revision records include the affected history and immediate context. Nu `pending`
+uses flat rows for revisions, tag updates, removed bookmarks and fetch errors.
+Summary lists are bounded with explicit overflow counts; full data remains
+available through `--details`. `--verbose`
 includes the full native operation diff. `--preview` remains an alias for
 `--dry-run`. Local working files are snapshotted before preparing the copy.
 

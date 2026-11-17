@@ -1454,7 +1454,7 @@ fn structured_preview_pairs_rewrites_and_keeps_descendants_available_without_che
     assert!(terminal.contains("Alacritty"));
     // The Nu commands return records, and ^ still selects the executable.
     let module = Path::new(env!("CARGO_MANIFEST_DIR")).join("nushell/jj-sync-commands.nu");
-    let script = format!("use {} *; let p = (jj-sync pending --cached --config {} --path {}); if ($p | first | get peer) != 'remover' {{ error make {{msg: 'missing peer'}} }}; let r = (jj-sync apply --dry-run --cached --config {} --path {}); if $r.workspace.after != '{}' {{ error make {{msg: 'wrong checkout'}} }}; ^jj-sync --version", quote(&module), quote(&config), quote(&target), quote(&config), quote(&target), new_tip);
+    let script = format!("use {} *; let p = (jj-sync pending --cached --config {} --path {}); if ($p | first | get peer) != 'remover' {{ error make {{msg: 'missing peer'}} }}; let r = (jj-sync apply --dry-run --cached --details --config {} --path {}); if $r.workspace.after != '{}' {{ error make {{msg: 'wrong checkout'}} }}; ^jj-sync --version", quote(&module), quote(&config), quote(&target), quote(&config), quote(&target), new_tip);
     let nu = Command::new("nu")
         .env(
             "PATH",
@@ -1765,4 +1765,218 @@ fn notification_acknowledgement_preserves_a_newer_publication() {
     assert_ne!(old, new);
     sync.flush_notifications().unwrap();
     assert_eq!(fs::read_dir(queue).unwrap().count(), 0);
+}
+
+#[test]
+fn small_peer_rewrite_has_bounded_details_and_nushell_display_in_a_large_history() {
+    let fixture = Fixture::new();
+    let mut sync = fixture.sync();
+    let source = fixture.repo("remote-dev/project", false);
+    let target = fixture.repo("dev/project", true);
+    let base = fixture.commit(&source, "@");
+    fixture.jj(
+        &source,
+        &[
+            "new",
+            "-m",
+            "Collect display failure diagnostics from a TTY",
+        ],
+        true,
+    );
+    fs::write(source.join("diagnostics"), "capture diagnostics\n").unwrap();
+    fixture.jj(&source, &["bookmark", "set", "diagnostics"], true);
+    let old = fixture.commit(&source, "@");
+    fixture.jj(
+        &source,
+        &["new", &base, "-m", "Historical configuration 0"],
+        true,
+    );
+    for i in 1..165 {
+        fixture.jj(
+            &source,
+            &["new", "-m", &format!("Historical configuration {i}")],
+            true,
+        );
+    }
+    fixture.jj(&source, &["tag", "set", "nixos/Thastrom/123"], false);
+    let deployed = fixture.commit(&source, "@");
+    let mut remote = fixture.sync();
+    remote.config.host = "remover".into();
+    remote.config.state = fixture.path("remote-state");
+    remote
+        .config
+        .repository_roots
+        .insert("dev".into(), fixture.path("remote-dev"));
+    remote.snapshot(&source, false).unwrap();
+    sync.tools.ssh = transport(&fixture, &remote.config);
+    std::env::set_var("GIT_SSH_VARIANT", "ssh");
+    sync.accept_key("remover", &remote.public_key().unwrap())
+        .unwrap();
+    sync.cycle().unwrap();
+    sync.apply(&target, false).unwrap();
+    let checkout = fixture.commit(&target, "@");
+    fixture.jj(
+        &source,
+        &["rebase", "-r", "diagnostics", "-d", &deployed],
+        true,
+    );
+    let replacement = fixture.commit(&source, "diagnostics");
+    remote.snapshot(&source, false).unwrap();
+    sync.cycle().unwrap();
+    let config = fixture.path("compact-cli.json");
+    fs::write(&config, serde_json::to_string(&sync.config).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_jj-sync"))
+        .arg("--config")
+        .arg(&config)
+        .args(["apply", "--dry-run", "--cached", "--json", "--path"])
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(report["changes"][0]["kind"], "rewritten");
+    assert_eq!(report["changes"][0]["before"], json!([old]));
+    assert_eq!(report["changes"][0]["after"], json!([replacement]));
+    assert_eq!(report["workspace"]["before"], checkout);
+    assert_eq!(report["workspace"]["after"], checkout);
+    assert!(report["workspace"]["files"].as_array().unwrap().is_empty());
+    assert!(
+        report["revisions"].as_array().unwrap().len() <= 8,
+        "Only affected history belongs in the detailed report: {} revisions",
+        report["revisions"].as_array().unwrap().len()
+    );
+    assert!(output.stdout.len() < 16000);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Historical configuration 70"));
+    let module = Path::new(env!("CARGO_MANIFEST_DIR")).join("nushell/jj-sync-commands.nu");
+    let script = format!(
+        r#"
+use {} *
+let summary = (jj-sync apply --dry-run --cached --config {} --path {})
+if $summary.workspace.files != 0 or $summary.conflicts != 0 or $summary.divergent != 0 {{ error make {{msg: 'incorrect workspace summary'}} }}
+if not ($summary.workspace.checkout | str starts-with 'unchanged') {{ error make {{msg: 'checkout should be unchanged'}} }}
+if ($summary.changes | length) != 1 {{ error make {{msg: 'only one change is affected'}} }}
+for width in [80 120] {{
+  let display = ($summary | table --expand --width $width | into string)
+  if ($display | lines | length) > 40 {{ error make {{msg: $'Unbounded display at width ($width): ($display)'}} }}
+  if ($display | str contains 'Historical configuration') {{ error make {{msg: 'unrelated history leaked into summary'}} }}
+}}
+let pending = (jj-sync pending --cached --config {} --path {})
+if ($pending | length) != 1 or ($pending | first | get kind) != 'incoming' {{ error make {{msg: 'pending should show one incoming revision'}} }}
+if ($pending | first | get revision | str length) != 8 {{ error make {{msg: 'pending IDs should be short'}} }}
+let details = (jj-sync apply --dry-run --cached --details --config {} --path {})
+if $details.workspace.after != '{}' {{ error make {{msg: 'details must retain full IDs'}} }}
+if not ('operation_before' in ($details | columns)) {{ error make {{msg: 'details missing recovery operation'}} }}
+if 'revisions' in ($summary | columns) {{ error make {{msg: 'raw graph must be opt-in'}} }}
+$summary | table --expand --width 120
+"#,
+        quote(&module),
+        quote(&config),
+        quote(&target),
+        quote(&config),
+        quote(&target),
+        quote(&config),
+        quote(&target),
+        checkout
+    );
+    let output = Command::new("nu")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                Path::new(env!("CARGO_BIN_EXE_jj-sync"))
+                    .parent()
+                    .unwrap()
+                    .display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .args(["--no-config-file", "-c", &script])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).lines().count() < 40);
+    assert_eq!(fixture.commit(&target, "@"), checkout);
+    sync.apply(&target, false).unwrap();
+    assert_eq!(fixture.commit(&target, "@"), checkout);
+    assert_eq!(
+        fixture.commit(&target, "diagnostics@sync-remover"),
+        replacement
+    );
+    std::env::remove_var("GIT_SSH_VARIANT");
+}
+
+#[test]
+fn nushell_summaries_bound_divergence_and_keep_errors_and_full_details_accessible() {
+    let fixture = Fixture::new();
+    let ids: Vec<_> = (0..12).map(|n| format!("{n:040x}")).collect();
+    let revision = json!({"commit_id": ids[0], "change_id": "xvsnuyqtksquqktrsqpzqztxnktuqotp", "description": "Feature\n", "parents": []});
+    let changes: Vec<_> = (0..15).map(|n| json!({"change_id": "xvsnuyqtksquqktrsqpzqztxnktuqotp", "before": ids, "after": ids, "kind": "divergent", "description": format!("Feature {n}")})).collect();
+    let report = json!({
+        "dry_run": true, "peers": ["remover"], "changes": changes,
+        "workspace": {"before": ids[0], "after": ids[1],
+            "files": (0..15).map(|n| json!({"path": format!("file-{n}"), "status": "modified"})).collect::<Vec<_>>(),
+            "available_outside_ancestry": vec![revision.clone(); 13]},
+        "conflicts": ids, "divergent": ids, "bookmarks": [], "tags": [],
+        "revisions": vec![revision.clone(); 200], "evolution": [], "operation_before": "recovery-operation"
+    });
+    let pending = json!({"repository": "dev/project", "peers": {
+        "remover": {"pending": true, "lastSuccess": "2026-11-17T16:38:51Z", "error": "SSH connection refused", "revisions": vec![revision; 15], "tags": [], "deleted_bookmarks": []},
+        "empty": {"pending": false, "lastSuccess": null, "error": null, "revisions": [], "tags": [], "deleted_bookmarks": []},
+        "same": {"pending": false, "lastSuccess": "2026-11-17T16:38:51Z", "error": null, "revisions": [], "tags": [], "deleted_bookmarks": []}
+    }});
+    let apply_file = fixture.path("apply-report.json");
+    let pending_file = fixture.path("pending-report.json");
+    fs::write(&apply_file, report.to_string()).unwrap();
+    fs::write(&pending_file, pending.to_string()).unwrap();
+    fs::create_dir(fixture.path("mock-bin")).unwrap();
+    fixture.script("mock-bin/jj-sync", &format!("#!/bin/sh\nfor arg do\n if [ \"$arg\" = pending ]; then exec cat {}; fi\ndone\nexec cat {}\n", quote(&pending_file), quote(&apply_file)));
+    let module = Path::new(env!("CARGO_MANIFEST_DIR")).join("nushell/jj-sync-commands.nu");
+    let script = format!(
+        r#"
+use {} *
+let summary = (jj-sync apply --dry-run)
+if ($summary.changes | length) != 10 or $summary.more_changes != 5 {{ error make {{msg: 'changes must have visible overflow counts'}} }}
+if not ($summary.changes.0.before | str ends-with '+10') {{ error make {{msg: 'divergent version lists must be bounded'}} }}
+if $summary.more_files != 5 or $summary.more_outside_checkout != 3 {{ error make {{msg: 'workspace lists must have overflow counts'}} }}
+if $summary.conflicts != 12 or ($summary.conflicts_revisions | length) != 10 {{ error make {{msg: 'conflicts must remain visible'}} }}
+let full = (jj-sync apply --dry-run --details)
+let compatible = (jj-sync apply --dry-run --json)
+if ($full.revisions | length) != 200 or $compatible != $full {{ error make {{msg: 'full details must remain accessible'}} }}
+if ($full.changes.0.before.0 | str length) != 40 {{ error make {{msg: 'details must retain full IDs'}} }}
+let pending = (jj-sync pending --cached)
+if ($pending | where kind == error | get description) != ['SSH connection refused'] {{ error make {{msg: 'fetch errors must survive truncation'}} }}
+if ($pending | where kind == more | length) != 1 {{ error make {{msg: 'pending overflow must be explicit'}} }}
+if ($pending | where peer == empty | get kind) != ['unfetched'] {{ error make {{msg: 'unfetched peer missing'}} }}
+if ($pending | where peer == same | get kind) != ['up to date'] {{ error make {{msg: 'up-to-date peer missing'}} }}
+let full_pending = (jj-sync pending --details)
+if ($full_pending | where peer == remover | first | get revisions | length) != 15 {{ error make {{msg: 'pending details were truncated'}} }}
+"#,
+        quote(&module)
+    );
+    let output = Command::new("nu")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fixture.path("mock-bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .args(["--no-config-file", "-c", &script])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

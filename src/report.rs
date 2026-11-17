@@ -175,7 +175,7 @@ impl Sync {
         } else {
             self.evolution(repo, "all()")?
         };
-        let changes = affected
+        let changes: Vec<Change> = affected
             .iter()
             .map(|change| {
                 let old: Vec<_> = before.values().filter(|r| &r.change_id == change).collect();
@@ -273,23 +273,68 @@ impl Sync {
         let conflict_ids = |revset| -> Result<Vec<String>> {
             Ok(self.revisions(repo, revset)?.into_keys().collect())
         };
+        let conflicts = conflict_ids("conflicts()")?;
+        let divergent = conflict_ids("divergent() ~ immutable()")?;
+        let bookmarks = ref_changes(&before_refs.0, &self.refs(repo, "bookmark")?);
+        let tags = ref_changes(&before_refs.1, &self.refs(repo, "tag")?);
+        let evolution: Vec<_> = evolution
+            .into_iter()
+            .filter(|e| {
+                affected.contains(&e.successor.change_id)
+                    || e.predecessors
+                        .iter()
+                        .any(|p| affected.contains(&p.change_id))
+            })
+            .collect();
         let mut revisions = before.clone();
-        revisions.extend(after.clone());
+        revisions.extend(after);
+        // Detail records describe the comparison, rather than serializing the
+        // entire repository. Include changed versions, checkout effects, issues,
+        // changed ref targets and their immediate parents for graph context.
+        let mut relevant: BTreeSet<String> = changes
+            .iter()
+            .flat_map(|c| c.before.iter().chain(&c.after))
+            .cloned()
+            .chain([before_tip.to_owned(), after_tip.clone()])
+            .chain(leaving.keys().cloned())
+            .chain(entering.keys().cloned())
+            .chain(outside.iter().map(|r| r.commit_id.clone()))
+            .chain(conflicts.iter().cloned())
+            .chain(divergent.iter().cloned())
+            .chain(
+                evolution
+                    .iter()
+                    .flat_map(|e| std::iter::once(&e.successor).chain(&e.predecessors))
+                    .map(|r| r.commit_id.clone()),
+            )
+            .collect();
+        for change in bookmarks.iter().chain(&tags) {
+            for value in change.before.iter().chain(&change.after) {
+                for field in ["target", "tracking_target"] {
+                    if let Some(targets) = value[field].as_array() {
+                        relevant.extend(
+                            targets
+                                .iter()
+                                .filter_map(|id| id.as_str().map(str::to_owned)),
+                        );
+                    }
+                }
+            }
+        }
+        let parents: Vec<_> = relevant
+            .iter()
+            .filter_map(|id| revisions.get(id))
+            .flat_map(|r| r.parents.iter().cloned())
+            .collect();
+        relevant.extend(parents);
+        revisions.retain(|id, _| relevant.contains(id));
         Ok(Report {
             schema_version: 1,
             repository: repository.into(),
             dry_run,
             peers,
             changes,
-            evolution: evolution
-                .into_iter()
-                .filter(|e| {
-                    affected.contains(&e.successor.change_id)
-                        || e.predecessors
-                            .iter()
-                            .any(|p| affected.contains(&p.change_id))
-                })
-                .collect(),
+            evolution,
             revisions: revisions.into_values().collect(),
             workspace: Workspace {
                 before: before_tip.into(),
@@ -299,10 +344,10 @@ impl Sync {
                 leaving_ancestry: leaving.into_values().collect(),
                 entering_ancestry: entering.into_values().collect(),
             },
-            conflicts: conflict_ids("conflicts()")?,
-            divergent: conflict_ids("divergent() ~ immutable()")?,
-            bookmarks: ref_changes(&before_refs.0, &self.refs(repo, "bookmark")?),
-            tags: ref_changes(&before_refs.1, &self.refs(repo, "tag")?),
+            conflicts,
+            divergent,
+            bookmarks,
+            tags,
             operation_before: baseline.into(),
             operation_after: self.jj(
                 repo,

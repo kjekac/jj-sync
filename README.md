@@ -90,16 +90,27 @@ with `use /path/to/package/share/nushell/jj-sync-commands.nu *`; nix-config load
 it automatically. The custom commands return records:
 
 ```nu
-jj-sync pending                              # One row per peer, including incoming revisions
+jj-sync pending                              # Flat rows for incoming changes and fetch errors
+jj-sync pending --details                    # Full peer records and fetch metadata
 jj-sync status                               # Cached transport status
 let preview = (jj-sync apply --dry-run)
 $preview.changes | select change_id before after kind description
-$preview.workspace                           # Checkout transition and file changes
-$preview.evolution                           # JJ predecessor relationships, including splits
+$preview.workspace                           # Checkout effect and number of changed files
+jj-sync apply --dry-run --details | get workspace.files
+jj-sync apply --dry-run --details | get evolution
 jj-sync apply
 ^jj-sync apply --dry-run                      # Colored terminal graph and comparison
 ^jj-sync apply --dry-run --verbose            # Also show the native operation diff
 ```
+
+Nushell returns a compact summary by default: short paired revision IDs, checkout
+effects, file counts, conflicts and divergence. File changes and changes outside
+the checkout appear when present. Lists show at most ten entries with explicit
+overflow counts; divergent version cells show at most two IDs plus an overflow
+count. `--details` returns the full report with full IDs and recovery operations.
+The existing Nu `--json` flag is an alias for `--details`; `^jj-sync … --json`
+produces JSON text. Detailed revision records contain affected versions and their
+immediate context, rather than every revision in the repository.
 
 The terminal comparison pairs versions by change ID and renders the proposed
 visible history with JJ. `@` marks the resulting checkout. Apply follows the
