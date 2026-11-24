@@ -1931,7 +1931,8 @@ fn nushell_summaries_bound_divergence_and_keep_errors_and_full_details_accessibl
     let pending = json!({"repository": "dev/project", "peers": {
         "remover": {"pending": true, "lastSuccess": "2026-11-17T16:38:51Z", "error": "SSH connection refused", "revisions": vec![revision; 15], "tags": [], "deleted_bookmarks": []},
         "empty": {"pending": false, "lastSuccess": null, "error": null, "revisions": [], "tags": [], "deleted_bookmarks": []},
-        "same": {"pending": false, "lastSuccess": "2026-11-17T16:38:51Z", "error": null, "revisions": [], "tags": [], "deleted_bookmarks": []}
+        "same": {"pending": false, "lastSuccess": "2026-11-17T16:38:51Z", "error": null, "revisions": [], "tags": [], "deleted_bookmarks": []},
+        "cleanup": {"pending": true, "lastSuccess": "2026-11-24T13:10:09Z", "error": null, "revisions": [], "tags": [], "deleted_bookmarks": [], "deleted_tags": ["archive/nixos/Thastrom/123/old"]}
     }});
     let apply_file = fixture.path("apply-report.json");
     let pending_file = fixture.path("pending-report.json");
@@ -1957,6 +1958,8 @@ if ($pending | where kind == error | get description) != ['SSH connection refuse
 if ($pending | where kind == more | length) != 1 {{ error make {{msg: 'pending overflow must be explicit'}} }}
 if ($pending | where peer == empty | get kind) != ['unfetched'] {{ error make {{msg: 'unfetched peer missing'}} }}
 if ($pending | where peer == same | get kind) != ['up to date'] {{ error make {{msg: 'up-to-date peer missing'}} }}
+if ($pending | where peer == cleanup | get kind) != ['tag removed'] {{ error make {{msg: 'deleted peer tag missing'}} }}
+if ($pending | where peer == cleanup | get description) != ['archive/nixos/Thastrom/123/old@sync-cleanup'] {{ error make {{msg: 'deleted peer tag must name its remote'}} }}
 let full_pending = (jj-sync pending --details)
 if ($full_pending | where peer == remover | first | get revisions | length) != 15 {{ error make {{msg: 'pending details were truncated'}} }}
 "#,
@@ -2104,4 +2107,133 @@ fn retention_hooks_are_isolated_from_staging_and_preview_live_policy() {
         .unwrap();
     assert!(!tags(&reader).contains("nixos/Remover/1"));
     assert!(!tags(&reader).contains("archive/"));
+}
+
+#[test]
+fn removed_peer_tag_is_pending_even_if_old_versions_accepted_the_snapshot() {
+    let fixture = Fixture::new();
+    let mut sync = fixture.sync();
+    let source = fixture.repo("remote-dev/project", false);
+    let target = fixture.repo("dev/project", true);
+    let mut remote = fixture.sync();
+    remote.config.host = "remover".into();
+    remote.config.state = fixture.path("remote-state");
+    remote
+        .config
+        .repository_roots
+        .insert("dev".into(), fixture.path("remote-dev"));
+    let deployed = fixture.commit(&source, "@");
+    let canonical = "nixos/Thastrom/123";
+    let archive = format!("archive/{canonical}/{deployed}");
+    fixture.jj(
+        &source,
+        &["tag", "set", canonical, &archive, "-r", &deployed],
+        false,
+    );
+    remote.snapshot(&source, false).unwrap();
+    sync.tools.ssh = transport(&fixture, &remote.config);
+    std::env::set_var("GIT_SSH_VARIANT", "ssh");
+    sync.accept_key("remover", &remote.public_key().unwrap())
+        .unwrap();
+    sync.cycle().unwrap();
+    sync.apply(&target, true).unwrap();
+    sync.apply(&target, false).unwrap();
+    // Match the user's state: delete the local duplicate, while the old peer
+    // view remains. Retain the canonical tag independently of peer tracking.
+    fixture.jj(&target, &["tag", "delete", &archive], false);
+    fixture.jj(
+        &target,
+        &["tag", "untrack", &format!("{canonical}@sync-remover")],
+        false,
+    );
+    fixture.jj(&source, &["tag", "delete", &archive], false);
+    remote.snapshot(&source, false).unwrap();
+    sync.cycle().unwrap();
+    assert_eq!(sync.pending(&target).unwrap(), 1);
+    let stage = sync.config.state.join("staging/remover/dev/project");
+    // Reproduce the old implementation's false "up to date" baseline.
+    let refs = fixture.jj(
+        &stage,
+        &[
+            "bookmark",
+            "list",
+            "--remote",
+            "sync-remover",
+            "-T",
+            "if(!conflict, name ++ \"\\t\" ++ normal_target.commit_id() ++ \"\\n\")",
+        ],
+        false,
+    );
+    let tags = fixture.jj(
+        &stage,
+        &[
+            "tag",
+            "list",
+            "--all-remotes",
+            "-T",
+            "name ++ \" \" ++ if(conflict, \"CONFLICT\", normal_target.commit_id()) ++ \"\\n\"",
+        ],
+        false,
+    );
+    let tags = tags
+        .lines()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\n");
+    write_atomic(
+        &sync.config.state.join("accepted/remover/dev/project.json"),
+        &format!("{refs}\n{tags}"),
+    )
+    .unwrap();
+    sync.cycle().unwrap();
+    assert_eq!(sync.pending(&target).unwrap(), 1);
+    let config_file = fixture.path("cli-config.json");
+    fs::write(&config_file, serde_json::to_string(&sync.config).unwrap()).unwrap();
+    let cli = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_jj-sync"))
+            .arg("--config")
+            .arg(&config_file)
+            .args(args)
+            .arg("--path")
+            .arg(&target)
+            .output()
+            .unwrap()
+    };
+    let pending = cli(&["pending", "--cached", "--json"]);
+    assert!(pending.status.success());
+    let pending: serde_json::Value = serde_json::from_slice(&pending.stdout).unwrap();
+    assert_eq!(
+        pending["peers"]["remover"]["deleted_tags"],
+        json!([archive])
+    );
+    assert_eq!(pending["peers"]["remover"]["revisions"], json!([]));
+    let before = fixture.commit(&target, "@");
+    let old_peer_tag = format!("{archive}@sync-remover");
+    let preview = cli(&["apply", "--dry-run", "--cached", "--json"]);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert!(preview.to_string().contains(&archive));
+    assert_eq!(fixture.commit(&target, &old_peer_tag), deployed);
+    assert_eq!(fixture.commit(&target, "@"), before);
+    sync.apply(&target, false).unwrap();
+    assert_eq!(fixture.commit(&target, "@"), before);
+    assert_eq!(fixture.commit(&target, canonical), deployed);
+    assert!(!fixture
+        .jj(&target, &["tag", "list", "--all-remotes"], false)
+        .contains(&archive));
+    assert_eq!(sync.pending(&target).unwrap(), 0);
+    // Deleting the canonical peer ref is also cleanup, while the local tag stays.
+    fixture.jj(&source, &["tag", "delete", canonical], false);
+    remote.snapshot(&source, false).unwrap();
+    sync.cycle().unwrap();
+    assert_eq!(sync.pending(&target).unwrap(), 1);
+    sync.apply(&target, true).unwrap();
+    sync.apply(&target, false).unwrap();
+    assert_eq!(fixture.commit(&target, canonical), deployed);
+    assert_eq!(sync.pending(&target).unwrap(), 0);
 }

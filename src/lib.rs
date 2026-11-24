@@ -778,6 +778,30 @@ impl Sync {
             .join(peer)
             .join(format!("{}.json", id.0))
     }
+    fn deleted_peer_tags(&self, local: &Path, stage: &Path, peer: &str) -> Result<Vec<String>> {
+        let names = |repo: &Path| -> Result<BTreeSet<String>> {
+            Ok(self
+                .jj(
+                    repo,
+                    &[
+                        "--at-op=@",
+                        "tag",
+                        "list",
+                        "--remote",
+                        &format!("sync-{peer}"),
+                        "-T",
+                        "name ++ \"\\n\"",
+                    ],
+                    false,
+                    false,
+                    false,
+                )?
+                .lines()
+                .map(str::to_owned)
+                .collect())
+        };
+        Ok(names(local)?.difference(&names(stage)?).cloned().collect())
+    }
     fn pending_stage(&self, stage: &Path, peer: &str, id: &RepositoryId) -> Result<bool> {
         let fingerprint = self.stage_fingerprint(stage, peer)?;
         let accepted = self.accepted_path(peer, id);
@@ -786,13 +810,18 @@ impl Sync {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(error) => return Err(error.into()),
         };
+        let repos = self.discover()?;
+        let Some(local) = repos.get(id).filter(|repo| repo.jj) else {
+            return Ok(previous != fingerprint);
+        };
+        // Compare imported peer refs before trusting the accepted fingerprint:
+        // older versions baselined tag deletions without applying their cleanup.
+        if !self.deleted_peer_tags(&local.path, stage, peer)?.is_empty() {
+            return Ok(true);
+        }
         if previous == fingerprint {
             return Ok(false);
         }
-        let repos = self.discover()?;
-        let Some(local) = repos.get(id).filter(|repo| repo.jj) else {
-            return Ok(true);
-        };
         let incoming = parse_pairs(&self.stage_refs(stage, peer)?, '\t')?;
         // A removed previously accepted bookmark is a real publication change,
         // even when its old commit remains available locally.
@@ -957,9 +986,11 @@ impl Sync {
                 .or(entry.error.clone());
             let mut revisions = Vec::new();
             let mut tags = Vec::new();
+            let mut deleted_tags = Vec::new();
             let mut deleted_bookmarks = Vec::new();
             if entry.pending == Some(true) {
                 let stage = self.config.state.join("staging").join(peer).join(&id.0);
+                deleted_tags = self.deleted_peer_tags(&local.path, &stage, peer)?;
                 let refs = parse_pairs(&self.stage_refs(&stage, peer)?, '\t')?;
                 let tips: BTreeSet<_> = refs.values().cloned().collect();
                 if !tips.is_empty() {
@@ -1041,9 +1072,12 @@ impl Sync {
                 for name in &deleted_bookmarks {
                     println!("  Bookmark removed: {name}");
                 }
+                for name in &deleted_tags {
+                    println!("  Peer tag removed: {name}@sync-{peer}");
+                }
             }
             updates.insert(peer, serde_json::json!({"pending": entry.pending.unwrap_or(false), "lastSuccess": entry.last_success,
-                "error": error, "revisions": revisions, "tags": tags, "deleted_bookmarks": deleted_bookmarks}));
+                "error": error, "revisions": revisions, "tags": tags, "deleted_bookmarks": deleted_bookmarks, "deleted_tags": deleted_tags}));
         }
         if json {
             println!(

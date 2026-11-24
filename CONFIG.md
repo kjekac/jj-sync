@@ -117,6 +117,12 @@ Status records the latest pass and retains peer and repository success timestamp
 across offline failures. `cycle` writes status before returning failure. `status`
 prints the saved results regardless of the last cycle's outcome.
 
+Pending updates include peer tag deletions, compared against the peer refs still
+imported in the live repository. A matching cached fingerprint does not suppress
+that cleanup. `pending` lists removed peer tags separately from incoming commits;
+`apply --dry-run` previews the native fetch that removes those remote refs. Local
+deployment tags retained independently of remote tracking remain in place.
+
 Optional `preFetchCommand` and `postFetchCommand` are absolute executable paths.
 They run directly with the repository path as their only argument, before and
 after a live apply or GitHub fetch. Use them for repository policy such as

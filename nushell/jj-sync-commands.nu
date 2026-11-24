@@ -57,7 +57,10 @@ export def "jj-sync pending" [
         let deleted = ($update.deleted_bookmarks | each {|name|
           {peer: $peer kind: removed change_id: '' revision: '' description: $name}
         })
-        mut rows = ($changes | append $tags | append $deleted)
+        let deleted_tags = ($update.deleted_tags? | default [] | each {|name|
+          {peer: $peer kind: 'tag removed' change_id: '' revision: '' description: $"($name)@sync-($peer)"}
+        })
+        mut rows = ($changes | append $tags | append $deleted | append $deleted_tags)
         let total = ($rows | length)
         $rows = ($rows | take 10)
         if $total > 10 {
