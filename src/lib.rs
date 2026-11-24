@@ -74,6 +74,8 @@ pub struct Config {
     #[serde(default)]
     pub remote_command: Option<String>,
     #[serde(default)]
+    pub pre_fetch_command: Option<PathBuf>,
+    #[serde(default)]
     pub post_fetch_command: Option<PathBuf>,
 }
 
@@ -91,8 +93,13 @@ impl Config {
                 "Invalid host, peer or root name: {name:?}"
             );
         }
-        if let Some(path) = &config.post_fetch_command {
-            ensure!(path.is_absolute(), "postFetchCommand must be absolute");
+        for (name, path) in [
+            ("preFetchCommand", &config.pre_fetch_command),
+            ("postFetchCommand", &config.post_fetch_command),
+        ] {
+            if let Some(path) = path {
+                ensure!(path.is_absolute(), "{name} must be absolute");
+            }
         }
         Ok(config)
     }
@@ -635,6 +642,26 @@ impl Sync {
         peer: bool,
         interactive: bool,
     ) -> Result<()> {
+        self.fetch_hook(repo, &self.config.pre_fetch_command)?;
+        self.fetch_refs(repo, name, url, peer, interactive)?;
+        self.fetch_hook(repo, &self.config.post_fetch_command)
+    }
+    fn fetch_hook(&self, repo: &Path, hook: &Option<PathBuf>) -> Result<()> {
+        if let Some(hook) = hook {
+            let mut command = self.command(hook);
+            command.arg(repo);
+            process::output(command, None, false)?;
+        }
+        Ok(())
+    }
+    fn fetch_refs(
+        &self,
+        repo: &Path,
+        name: &str,
+        url: &str,
+        peer: bool,
+        interactive: bool,
+    ) -> Result<()> {
         self.ensure_remote(repo, name, url)?;
         self.jj(
             repo,
@@ -645,11 +672,6 @@ impl Sync {
             interactive,
             peer,
         )?;
-        if let Some(hook) = &self.config.post_fetch_command {
-            let mut command = self.command(hook);
-            command.arg(repo);
-            process::output(command, None, false)?;
-        }
         Ok(())
     }
     fn stage_refs(&self, stage: &Path, peer: &str) -> Result<String> {
@@ -696,6 +718,34 @@ impl Sync {
                 false,
             )?;
         }
+        // Staging exports the peer's tags, not retention refs left by old hooks.
+        let tags = parse_pairs(&self.jj(stage, &[
+            "tag", "list", "--remote", &format!("sync-{peer}"), "-T",
+            "name ++ \"\\t\" ++ if(conflict, \"CONFLICT\", normal_target.commit_id()) ++ \"\\n\"",
+        ], false, false, false)?, '\t')?;
+        ensure!(
+            !tags.values().any(|target| target == "CONFLICT"),
+            "Conflicted peer tags in staging"
+        );
+        let locals = self.jj(
+            stage,
+            &["tag", "list", "-T", "if(!remote, name ++ \"\\n\")"],
+            false,
+            false,
+            false,
+        )?;
+        for name in locals.lines().filter(|name| !tags.contains_key(*name)) {
+            self.jj(stage, &["tag", "delete", name], false, false, false)?;
+        }
+        for (name, revision) in tags {
+            self.jj(
+                stage,
+                &["tag", "set", &name, "-r", &revision, "--allow-move"],
+                false,
+                false,
+                false,
+            )?;
+        }
         self.jj(stage, &["git", "export"], false, false, false)?;
         Ok(())
     }
@@ -713,6 +763,12 @@ impl Sync {
             false,
             false,
         )?;
+        let tags = tags
+            .lines()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("\n");
         Ok(format!("{}\n{}", self.stage_refs(stage, peer)?, tags))
     }
     fn accepted_path(&self, peer: &str, id: &RepositoryId) -> PathBuf {
@@ -929,6 +985,8 @@ impl Sync {
                     )?
                     .lines()
                     .filter(|tag| !local_tags.lines().any(|local| local == *tag))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
                     .map(str::to_owned)
                     .collect();
                 let previous = match fs::read_to_string(self.accepted_path(peer, &id)) {
@@ -1117,16 +1175,13 @@ impl Sync {
                 )?;
             }
             self.ensure_remote(&target, &name, &url)?;
+            self.fetch_hook(&target, &self.config.pre_fetch_command)?;
             let args = [
                 "git", "fetch", "--remote", &name, "--branch", "glob:*", "--tag", "glob:*",
             ];
             self.jj(&target, &args, !preview, false, false)?;
+            self.fetch_hook(&target, &self.config.post_fetch_command)?;
             if !preview {
-                if let Some(hook) = &self.config.post_fetch_command {
-                    let mut command = self.command(hook);
-                    command.arg(&target);
-                    process::output(command, None, false)?;
-                }
                 write_atomic(
                     &self.accepted_path(peer, id),
                     &self.stage_fingerprint(&stage, peer)?,
@@ -1233,7 +1288,7 @@ impl Sync {
                     .remove(b'.')
                     .remove(b'~');
                 let url = format!("ssh://{peer}/{}", utf8_percent_encode(&id.0, ENCODE));
-                self.fetch(&target, &format!("sync-{peer}"), &url, true, false)?;
+                self.fetch_refs(&target, &format!("sync-{peer}"), &url, true, false)?;
                 self.export_stage(&target, peer)?;
                 entry.pending = Some(self.pending_stage(&target, peer, id)?);
                 Ok(target)

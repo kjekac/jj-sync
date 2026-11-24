@@ -1980,3 +1980,128 @@ if ($full_pending | where peer == remover | first | get revisions | length) != 1
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn retention_hooks_are_isolated_from_staging_and_preview_live_policy() {
+    let fixture = Fixture::new();
+    let mut sync = fixture.sync();
+    let source = fixture.repo("remote-dev/project", false);
+    let target = fixture.repo("dev/project", true);
+    let mut remote = fixture.sync();
+    remote.config.host = "remover".into();
+    remote.config.state = fixture.path("remote-state");
+    remote
+        .config
+        .repository_roots
+        .insert("dev".into(), fixture.path("remote-dev"));
+    let deployed = fixture.commit(&source, "@");
+    fixture.jj(
+        &source,
+        &["tag", "set", "nixos/Remover/1", "-r", &deployed],
+        false,
+    );
+    remote.snapshot(&source, false).unwrap();
+    sync.tools.ssh = transport(&fixture, &remote.config);
+    std::env::set_var("GIT_SSH_VARIANT", "ssh");
+    sync.accept_key("remover", &remote.public_key().unwrap())
+        .unwrap();
+    let jj = quote(&sync.tools.jj);
+    sync.config.pre_fetch_command = Some(fixture.script(
+        "before-fetch",
+        &format!(
+        "#!/bin/sh\nset -eu\n{jj} -R \"$1\" --ignore-working-copy tag set policy/pre -r 'root()'\n"
+    ),
+    ));
+    sync.config.post_fetch_command = Some(fixture.script("after-fetch", &format!(
+        "#!/bin/sh\nset -eu\n{jj} -R \"$1\" --ignore-working-copy log -r policy/pre --no-graph -T commit_id >/dev/null\n{jj} -R \"$1\" --ignore-working-copy tag set policy/post -r {deployed}\n"
+    )));
+    sync.cycle().unwrap();
+    let stage = sync.config.state.join("staging/remover/dev/project");
+    let tags = |path: &Path| {
+        fixture.jj(
+            path,
+            &["tag", "list", "--all-remotes", "-T", "name ++ \"\\n\""],
+            false,
+        )
+    };
+    assert!(!tags(&stage).contains("policy/"));
+    assert!(!tags(&target).contains("policy/"));
+    let config_file = fixture.path("pending-config.json");
+    fs::write(&config_file, serde_json::to_string(&sync.config).unwrap()).unwrap();
+    let pending = Command::new(env!("CARGO_BIN_EXE_jj-sync"))
+        .arg("--config")
+        .arg(&config_file)
+        .args(["pending", "--cached", "--json", "--path"])
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(pending.status.success());
+    let pending: serde_json::Value = serde_json::from_slice(&pending.stdout).unwrap();
+    assert_eq!(
+        pending["peers"]["remover"]["tags"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // Old versions ran the archive hook in staging. Remove only refs that the
+    // peer did not advertise when refreshing that cache.
+    fixture.jj(
+        &stage,
+        &[
+            "tag",
+            "set",
+            "archive/nixos/Remover/1/stale",
+            "-r",
+            &deployed,
+        ],
+        false,
+    );
+    sync.cycle().unwrap();
+    assert!(!tags(&stage).contains("archive/"));
+    let baseline = fixture.jj(
+        &target,
+        &["op", "log", "--limit", "1", "--no-graph", "-T", "id"],
+        false,
+    );
+    sync.apply(&target, true).unwrap();
+    assert!(!tags(&target).contains("policy/"));
+    assert_eq!(
+        baseline,
+        fixture.jj(
+            &target,
+            &["op", "log", "--limit", "1", "--no-graph", "-T", "id"],
+            false
+        )
+    );
+    // A conflicting policy is reported in dry-run without importing live refs.
+    let valid = sync.config.post_fetch_command.clone();
+    sync.config.post_fetch_command = Some(fixture.script(
+        "reject-fetch",
+        "#!/bin/sh\necho 'Deployment tag conflict' >&2\nexit 1\n",
+    ));
+    assert!(sync
+        .apply(&target, true)
+        .unwrap_err()
+        .to_string()
+        .contains("Deployment tag conflict"));
+    assert!(!tags(&target).contains("policy/"));
+    sync.config.post_fetch_command = valid;
+    sync.apply(&target, true).unwrap();
+    sync.apply(&target, false).unwrap();
+    assert!(tags(&target).contains("policy/pre"));
+    assert!(tags(&target).contains("policy/post"));
+    assert!(!tags(&stage).contains("policy/"));
+    fixture.jj(&source, &["tag", "delete", "nixos/Remover/1"], false);
+    remote.snapshot(&source, false).unwrap();
+    sync.cycle().unwrap();
+    assert!(!tags(&stage).contains("nixos/Remover/1"));
+    // Inspect the exported staging refs through a fresh consumer, too.
+    let reader = fixture.repo("reader", false);
+    fixture
+        .sync()
+        .fetch(&reader, "stage", &fixture.url(&stage), false, false)
+        .unwrap();
+    assert!(!tags(&reader).contains("nixos/Remover/1"));
+    assert!(!tags(&reader).contains("archive/"));
+}

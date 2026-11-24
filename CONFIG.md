@@ -117,10 +117,16 @@ Status records the latest pass and retains peer and repository success timestamp
 across offline failures. `cycle` writes status before returning failure. `status`
 prints the saved results regardless of the last cycle's outcome.
 
-An optional `postFetchCommand` is an absolute executable path. It runs directly,
-with the repository path as its only argument, after each successful peer or
-GitHub fetch. Hook failure is reported as a cycle error. Use it for local policy
-such as retaining deployment tags.
+Optional `preFetchCommand` and `postFetchCommand` are absolute executable paths.
+They run directly with the repository path as their only argument, before and
+after a live apply or GitHub fetch. Use them for repository policy such as
+retaining deployment tags before remote refs change and validating incoming
+targets afterward. Failures stop the operation and are reported; a post-fetch
+failure leaves the fetch visible for inspection and does not accept the snapshot.
+
+Dry-run executes both hooks against its isolated repository. Hooks must confine
+their effects to the supplied repository. Staging fetches run neither hook and
+export exactly the peer's refs; they never manufacture local retention tags.
 
 `github` selects an existing GitHub remote, preferring `origin`. It fetches through
 an untracked `sync-github` remote, publishes host workspace and feature bookmarks,

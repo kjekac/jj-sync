@@ -33,6 +33,7 @@ rustPlatform.buildRustPackage {
     stagedUpdates = true;
     structuredOutput = true;
     eventNotifications = true;
+    isolatedFetchHooks = true;
     nativeExecutable = true;
     inherit jujutsu;
   };
